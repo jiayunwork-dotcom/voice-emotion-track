@@ -853,6 +853,24 @@ def render_stream_monitor_page():
                     st.caption(f"共 {len(frames)} 帧分析结果")
                     plot_stream_emotion_trajectory(frames)
 
+                    st.subheader("🥧 情绪分布")
+                    from collections import Counter
+                    emotion_counts = Counter([f["emotion"] for f in frames])
+                    pie_labels = [EMOTION_LABELS_CN.get(k, k) for k in emotion_counts.keys()]
+                    pie_colors = [EMOTION_COLORS.get(k, "#808080") for k in emotion_counts.keys()]
+                    fig_pie = go.Figure(data=[go.Pie(
+                        labels=pie_labels,
+                        values=list(emotion_counts.values()),
+                        marker=dict(colors=pie_colors),
+                        textinfo='label+percent',
+                        hole=0.3
+                    )])
+                    fig_pie.update_layout(
+                        title="实时情绪分布 (最近100帧)",
+                        height=350
+                    )
+                    st.plotly_chart(fig_pie, use_container_width=True)
+
                     with st.expander("📋 帧数据列表", expanded=False):
                         df_data = []
                         for f in frames:

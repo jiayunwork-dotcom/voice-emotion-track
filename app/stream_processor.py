@@ -5,10 +5,10 @@ import time
 import logging
 import numpy as np
 import librosa
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from app.config import get_config
 from app.feature_extractor import extract_features, features_to_vector
@@ -24,6 +24,7 @@ VALID_MODEL_MODES = {"svm", "rf", "wav2vec2"}
 MAX_ACTIVE_SESSIONS = 10
 CONFIG_TIMEOUT_SEC = 30
 ANALYSIS_TIMEOUT_MS = 500
+RING_BUFFER_SIZE = 100
 
 
 @dataclass
@@ -49,9 +50,14 @@ class StreamSession:
     timeout_frames: int = 0
     started_at: float = field(default_factory=time.time)
     last_active_at: float = field(default_factory=time.time)
-    results: List[FrameResult] = field(default_factory=list)
+    results_buffer: deque = field(default_factory=lambda: deque(maxlen=RING_BUFFER_SIZE))
+    all_results: List[FrameResult] = field(default_factory=list)
     config_received: bool = False
     closed: bool = False
+    alert_threshold: int = 3
+    alert_count: int = 0
+    recent_emotions: List[str] = field(default_factory=list)
+    emotion_counter: Counter = field(default_factory=Counter)
 
 
 _sessions: Dict[str, StreamSession] = {}
@@ -173,7 +179,7 @@ async def list_active_sessions() -> List[dict]:
         now = time.time()
         result = []
         for sid, sess in _sessions.items():
-            last_emotion = sess.results[-1].emotion if sess.results else None
+            last_emotion = sess.results_buffer[-1].emotion if sess.results_buffer else None
             result.append({
                 "session_id": sid,
                 "status": sess.status,
@@ -192,7 +198,7 @@ async def get_session_results(session_id: str) -> Optional[List[FrameResult]]:
     async with _sessions_lock:
         sess = _sessions.get(session_id)
         if sess:
-            return list(sess.results)
+            return list(sess.results_buffer)
         return None
 
 
@@ -202,7 +208,8 @@ async def update_session_activity(session_id: str):
             _sessions[session_id].last_active_at = time.time()
 
 
-async def set_session_config(session_id: str, sample_rate: int, chunk_duration_ms: int) -> bool:
+async def set_session_config(session_id: str, sample_rate: int, chunk_duration_ms: int,
+                             alert_threshold: Optional[int] = None) -> bool:
     async with _sessions_lock:
         if session_id not in _sessions:
             return False
@@ -211,6 +218,8 @@ async def set_session_config(session_id: str, sample_rate: int, chunk_duration_m
         sess.chunk_duration_ms = chunk_duration_ms
         sess.expected_bytes = _expected_byte_count(sample_rate, chunk_duration_ms)
         sess.config_received = True
+        if alert_threshold is not None and alert_threshold > 0:
+            sess.alert_threshold = alert_threshold
         return True
 
 
@@ -221,11 +230,52 @@ async def increment_frame_count(session_id: str):
             _sessions[session_id].last_active_at = time.time()
 
 
-async def append_frame_result(session_id: str, result: FrameResult):
+async def append_frame_result(session_id: str, result: FrameResult) -> Optional[dict]:
     async with _sessions_lock:
-        if session_id in _sessions:
-            _sessions[session_id].results.append(result)
-            _sessions[session_id].analyzed_frames += 1
+        if session_id not in _sessions:
+            return None
+        sess = _sessions[session_id]
+        sess.results_buffer.append(result)
+        sess.all_results.append(result)
+        sess.analyzed_frames += 1
+        sess.emotion_counter[result.emotion] += 1
+        alert = _check_emotion_shift(sess, result)
+        if alert is not None:
+            sess.alert_count += 1
+        return alert
+
+
+def _check_emotion_shift(session: StreamSession, result: FrameResult) -> Optional[dict]:
+    threshold = session.alert_threshold
+    session.recent_emotions.append(result.emotion)
+    max_keep = threshold + 1
+    if len(session.recent_emotions) > max_keep:
+        session.recent_emotions = session.recent_emotions[-max_keep:]
+
+    if len(session.recent_emotions) < threshold:
+        return None
+
+    last_n = session.recent_emotions[-threshold:]
+    if len(set(last_n)) != 1:
+        return None
+
+    shift_emotion = last_n[0]
+
+    if len(session.recent_emotions) > threshold:
+        pre_streak = session.recent_emotions[-(threshold + 1)]
+        if pre_streak == shift_emotion:
+            return None
+
+    dominant = session.emotion_counter.most_common(1)[0][0]
+    if shift_emotion == dominant:
+        return None
+
+    return {
+        "from_emotion": dominant,
+        "to_emotion": shift_emotion,
+        "trigger_seq": result.seq,
+        "sustained_frames": threshold
+    }
 
 
 async def increment_timeout_count(session_id: str):
@@ -235,7 +285,7 @@ async def increment_timeout_count(session_id: str):
 
 
 def compute_summary(session: StreamSession) -> dict:
-    if not session.results:
+    if not session.all_results:
         return {
             "dominant_emotion": "neutral",
             "valence_mean": 0.0,
@@ -243,15 +293,16 @@ def compute_summary(session: StreamSession) -> dict:
             "total_frames": session.frame_count,
             "analyzed_frames": session.analyzed_frames,
             "timeout_frames": session.timeout_frames,
-            "duration_seconds": round(session.frame_count * (session.chunk_duration_ms or 0) / 1000.0, 2)
+            "duration_seconds": round(session.frame_count * (session.chunk_duration_ms or 0) / 1000.0, 2),
+            "alert_count": session.alert_count
         }
 
-    emotions = [r.emotion for r in session.results]
+    emotions = [r.emotion for r in session.all_results]
     counter = Counter(emotions)
     dominant = counter.most_common(1)[0][0]
 
-    valences = [r.valence for r in session.results]
-    arousals = [r.arousal for r in session.results]
+    valences = [r.valence for r in session.all_results]
+    arousals = [r.arousal for r in session.all_results]
 
     duration = session.frame_count * (session.chunk_duration_ms or 0) / 1000.0
 
@@ -262,8 +313,17 @@ def compute_summary(session: StreamSession) -> dict:
         "total_frames": session.frame_count,
         "analyzed_frames": session.analyzed_frames,
         "timeout_frames": session.timeout_frames,
-        "duration_seconds": round(duration, 2)
+        "duration_seconds": round(duration, 2),
+        "alert_count": session.alert_count
     }
+
+
+async def get_all_session_results(session_id: str) -> Optional[List[FrameResult]]:
+    async with _sessions_lock:
+        sess = _sessions.get(session_id)
+        if sess:
+            return list(sess.all_results)
+        return None
 
 
 def persist_summary(session_id: str, summary: dict, results: List[FrameResult]):

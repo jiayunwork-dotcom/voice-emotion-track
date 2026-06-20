@@ -1,0 +1,47 @@
+{
+  "session_id": "test-perf",
+  "summary": {
+    "dominant_emotion": "neutral",
+    "valence_mean": 0.0132,
+    "arousal_mean": 0.058,
+    "total_frames": 5,
+    "analyzed_frames": 4,
+    "timeout_frames": 1,
+    "duration_seconds": 2.5
+  },
+  "frames": [
+    {
+      "seq": 2,
+      "emotion": "neutral",
+      "confidence": 0.1755,
+      "valence": 0.063,
+      "arousal": 0.044,
+      "timestamp_ms": 500
+    },
+    {
+      "seq": 3,
+      "emotion": "neutral",
+      "confidence": 0.1755,
+      "valence": -0.003,
+      "arousal": 0.096,
+      "timestamp_ms": 1000
+    },
+    {
+      "seq": 4,
+      "emotion": "neutral",
+      "confidence": 0.1755,
+      "valence": -0.082,
+      "arousal": -0.001,
+      "timestamp_ms": 1500
+    },
+    {
+      "seq": 5,
+      "emotion": "neutral",
+      "confidence": 0.1755,
+      "valence": 0.075,
+      "arousal": 0.093,
+      "timestamp_ms": 2000
+    }
+  ],
+  "saved_at": "2026-06-20T23:55:24.456062"
+}

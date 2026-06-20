@@ -32,10 +32,10 @@ from app.batch_processor import (
 )
 from app.stream_processor import (
     register_session, unregister_session, get_session, list_active_sessions,
-    get_session_results, update_session_activity, set_session_config,
-    increment_frame_count, append_frame_result, analyze_frame_with_timeout,
-    compute_summary, persist_summary, _pcm_bytes_to_float32,
-    increment_timeout_count,
+    get_session_results, get_all_session_results, update_session_activity,
+    set_session_config, increment_frame_count, append_frame_result,
+    analyze_frame_with_timeout, compute_summary, persist_summary,
+    _pcm_bytes_to_float32, increment_timeout_count,
     VALID_MODEL_MODES, CONFIG_TIMEOUT_SEC
 )
 
@@ -843,7 +843,9 @@ async def websocket_stream(websocket: WebSocket,
                 await websocket.close()
                 return
 
-            await set_session_config(session_id, sample_rate, chunk_duration_ms)
+            alert_threshold = config_data.get("alert_threshold")
+            await set_session_config(session_id, sample_rate, chunk_duration_ms,
+                                     alert_threshold=alert_threshold)
             config_received = True
             await _send_json(websocket, {
                 "type": "config_ack",
@@ -906,7 +908,7 @@ async def websocket_stream(websocket: WebSocket,
                     await increment_timeout_count(session_id)
                     await _send_json(websocket, {"type": "timeout", "seq": seq_counter})
                 else:
-                    await append_frame_result(session_id, result)
+                    alert = await append_frame_result(session_id, result)
                     await _send_json(websocket, {
                         "type": "result",
                         "seq": result.seq,
@@ -916,6 +918,15 @@ async def websocket_stream(websocket: WebSocket,
                         "arousal": result.arousal,
                         "timestamp_ms": result.timestamp_ms
                     })
+                    if alert is not None:
+                        await _send_json(websocket, {
+                            "type": "alert",
+                            "alert_type": "emotion_shift",
+                            "from_emotion": alert["from_emotion"],
+                            "to_emotion": alert["to_emotion"],
+                            "trigger_seq": alert["trigger_seq"],
+                            "sustained_frames": alert["sustained_frames"]
+                        })
 
                 await update_session_activity(session_id)
 
@@ -928,13 +939,13 @@ async def websocket_stream(websocket: WebSocket,
     finally:
         sess = await get_session(session_id)
         if sess is not None:
-            results = await get_session_results(session_id) or []
+            all_results = await get_all_session_results(session_id) or []
             summary = compute_summary(sess)
             try:
                 await _send_json(websocket, {"type": "summary", **summary})
             except Exception:
                 pass
-            persist_summary(session_id, summary, results)
+            persist_summary(session_id, summary, all_results)
         await unregister_session(session_id)
         try:
             await websocket.close()
