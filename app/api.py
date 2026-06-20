@@ -33,15 +33,16 @@ app.add_middleware(
 )
 
 _results_store: Dict[str, dict] = {}
-_active_requests = 0
-_request_lock = asyncio.Lock()
-_queue_count = 0
 
 config = get_config()
 MAX_FILE_SIZE = config["max_file_size_mb"] * 1024 * 1024
 REQUEST_TIMEOUT = config["request_timeout_seconds"]
 MAX_CONCURRENT = config["max_concurrent_requests"]
 MAX_QUEUE = config["max_queue_size"]
+
+_semaphore = asyncio.Semaphore(MAX_CONCURRENT)
+_queue_count = 0
+_queue_lock = asyncio.Lock()
 
 
 class TurningPointResponse(BaseModel):
@@ -120,25 +121,30 @@ class QueryResponse(BaseModel):
     error: Optional[str] = None
 
 
-async def _check_concurrency():
-    global _active_requests, _queue_count
-    async with _request_lock:
-        if _active_requests >= MAX_CONCURRENT:
+async def _acquire_slot():
+    global _queue_count
+    async with _queue_lock:
+        if _semaphore._value <= 0:
             if _queue_count >= MAX_QUEUE:
                 raise HTTPException(status_code=503, detail="Server too busy. Queue is full.")
             _queue_count += 1
-            return True
-        _active_requests += 1
-        return False
+    acquired = False
+    try:
+        acquired = await asyncio.wait_for(_semaphore.acquire(), timeout=REQUEST_TIMEOUT)
+    except asyncio.TimeoutError:
+        async with _queue_lock:
+            _queue_count = max(0, _queue_count - 1)
+        raise HTTPException(status_code=503, detail="Request timed out waiting in queue.")
+    if not acquired:
+        async with _queue_lock:
+            _queue_count = max(0, _queue_count - 1)
+        raise HTTPException(status_code=503, detail="Failed to acquire processing slot.")
+    async with _queue_lock:
+        _queue_count = max(0, _queue_count - 1)
 
 
-async def _release_concurrency(queued: bool):
-    global _active_requests, _queue_count
-    async with _request_lock:
-        if queued:
-            _queue_count -= 1
-        else:
-            _active_requests = max(0, _active_requests - 1)
+def _release_slot():
+    _semaphore.release()
 
 
 def _process_audio_sync(file_path: str, model_mode: str,
@@ -191,9 +197,8 @@ async def analyze_audio(
     is_dual_channel: bool = Query(False),
     output_format: str = Query("full", pattern="^(full|compact)$")
 ):
-    queued = False
+    await _acquire_slot()
     try:
-        queued = await _check_concurrency()
         contents = await file.read()
         if len(contents) > MAX_FILE_SIZE:
             raise HTTPException(status_code=413,
@@ -278,7 +283,7 @@ async def analyze_audio(
         return response
 
     finally:
-        await _release_concurrency(queued)
+        _release_slot()
 
 
 @app.get("/api/results/{task_id}", response_model=QueryResponse)

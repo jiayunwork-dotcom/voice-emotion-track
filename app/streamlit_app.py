@@ -6,7 +6,10 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import tempfile
 import os
+import io
 import json
+import struct
+import wave
 
 API_BASE = os.environ.get("API_BASE_URL", "http://localhost:8000")
 
@@ -55,36 +58,101 @@ def call_health_api():
         return None
 
 
-def plot_waveform_with_emotions(result):
+def _parse_audio_bytes(file_bytes, filename):
+    ext = os.path.splitext(filename or "audio.wav")[1].lower()
+    try:
+        import soundfile as sf
+        audio, sr = sf.read(io.BytesIO(file_bytes), dtype="float32")
+        if audio.ndim == 2:
+            audio = audio.mean(axis=1)
+        return audio, sr
+    except Exception:
+        pass
+    try:
+        import librosa
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
+        tmp.write(file_bytes)
+        tmp.close()
+        audio, sr = librosa.load(tmp.name, sr=None, mono=True)
+        os.unlink(tmp.name)
+        return audio, sr
+    except Exception:
+        pass
+    return None, None
+
+
+def _audio_segment_to_wav_bytes(audio_segment, sr):
+    pcm = (audio_segment * 32767).astype(np.int16)
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sr)
+        wf.writeframes(pcm.tobytes())
+    buf.seek(0)
+    return buf.read()
+
+
+def plot_waveform_with_emotions(result, audio_data=None, sr=None):
     sentences = result.get("sentences", [])
     if not sentences:
         st.info("没有检测到语音段")
         return
 
     fig = go.Figure()
-    for i, sent in enumerate(sentences):
-        emotion = sent["emotion"]
-        color = EMOTION_COLORS.get(emotion, "#808080")
-        label = f'{EMOTION_LABELS_CN.get(emotion, emotion)} ({sent["confidence"]:.2f})'
+
+    if audio_data is not None and sr is not None:
+        duration = len(audio_data) / sr
+        time_axis = np.linspace(0, duration, len(audio_data))
+        downsample = max(1, len(audio_data) // 8000)
+        t_ds = time_axis[::downsample]
+        y_ds = audio_data[::downsample]
         fig.add_trace(go.Scatter(
-            x=[sent["start_time"], sent["end_time"]],
-            y=[i % 2, i % 2],
-            mode='lines+markers',
-            line=dict(color=color, width=8),
-            marker=dict(size=10),
-            name=f'句{i+1}: {label}',
-            hovertext=f'{sent["speaker_id"]} | {sent["start_time"]:.1f}s-{sent["end_time"]:.1f}s<br>'
-                      f'情感: {label}<br>效价: {sent["valence"]:.2f} | 唤醒度: {sent["arousal"]:.2f}',
-            hoverinfo='text'
+            x=t_ds, y=y_ds, mode='lines',
+            line=dict(color='silver', width=1),
+            name='波形',
+            hoverinfo='skip'
         ))
+        for sent in sentences:
+            emotion = sent["emotion"]
+            color = EMOTION_COLORS.get(emotion, "#808080")
+            mid = (sent["start_time"] + sent["end_time"]) / 2
+            fig.add_vrect(
+                x0=sent["start_time"], x1=sent["end_time"],
+                fillcolor=color, opacity=0.25,
+                line_width=0
+            )
+            label = EMOTION_LABELS_CN.get(emotion, emotion)
+            fig.add_annotation(
+                x=mid, y=np.max(np.abs(y_ds)) * 0.85,
+                text=label, showarrow=False,
+                font=dict(color=color, size=11, family="Arial Black")
+            )
+        y_max = np.max(np.abs(y_ds)) * 1.2 if len(y_ds) > 0 else 1
+        fig.update_yaxes(range=[-y_max, y_max])
+    else:
+        for i, sent in enumerate(sentences):
+            emotion = sent["emotion"]
+            color = EMOTION_COLORS.get(emotion, "#808080")
+            label = f'{EMOTION_LABELS_CN.get(emotion, emotion)} ({sent["confidence"]:.2f})'
+            fig.add_trace(go.Scatter(
+                x=[sent["start_time"], sent["end_time"]],
+                y=[i % 2, i % 2],
+                mode='lines+markers',
+                line=dict(color=color, width=8),
+                marker=dict(size=10),
+                name=f'句{i+1}: {label}',
+                hovertext=f'{sent["speaker_id"]} | {sent["start_time"]:.1f}s-{sent["end_time"]:.1f}s<br>'
+                          f'情感: {label}<br>效价: {sent["valence"]:.2f} | 唤醒度: {sent["arousal"]:.2f}',
+                hoverinfo='text'
+            ))
 
     fig.update_layout(
-        title="语音分段与情感标注",
+        title="语音波形与情感标注",
         xaxis_title="时间 (秒)",
-        yaxis_title="",
+        yaxis_title="幅度",
         showlegend=True,
-        height=300,
-        yaxis=dict(showticklabels=False)
+        height=350
     )
     st.plotly_chart(fig, use_container_width=True)
 
@@ -272,6 +340,12 @@ def main():
         file_bytes = uploaded_file.read()
         st.audio(uploaded_file, format=uploaded_file.type if uploaded_file.type else "audio/wav")
 
+        if "audio_raw" not in st.session_state or st.session_state.get("audio_filename") != uploaded_file.name:
+            parsed_audio, parsed_sr = _parse_audio_bytes(file_bytes, uploaded_file.name)
+            st.session_state["audio_raw"] = parsed_audio
+            st.session_state["audio_sr"] = parsed_sr
+            st.session_state["audio_filename"] = uploaded_file.name
+
         if st.button("🔍 开始分析", type="primary"):
             with st.spinner("正在分析音频..."):
                 result = call_analyze_api(
@@ -299,7 +373,11 @@ def main():
             st.metric("通道数", info.get("channels", 0))
 
         st.header("🎵 波形与情感分段")
-        plot_waveform_with_emotions(result)
+        plot_waveform_with_emotions(
+            result,
+            audio_data=st.session_state.get("audio_raw"),
+            sr=st.session_state.get("audio_sr")
+        )
 
         st.header("📈 情绪轨迹曲线")
         plot_emotion_trajectory(result)
@@ -327,7 +405,21 @@ def main():
             sent_idx = st.selectbox("选择片段", range(len(sentences)),
                                     format_func=lambda i: f"句{i+1} ({sentences[i]['start_time']:.1f}s-{sentences[i]['end_time']:.1f}s) "
                                                            f"- {EMOTION_LABELS_CN.get(sentences[i]['emotion'], sentences[i]['emotion'])}")
-            st.info(f"播放: {sentences[sent_idx]['start_time']:.1f}s - {sentences[sent_idx]['end_time']:.1f}s")
+            sel = sentences[sent_idx]
+            audio_raw = st.session_state.get("audio_raw")
+            audio_sr = st.session_state.get("audio_sr")
+            if audio_raw is not None and audio_sr is not None:
+                start_sample = int(sel["start_time"] * audio_sr)
+                end_sample = int(sel["end_time"] * audio_sr)
+                end_sample = min(end_sample, len(audio_raw))
+                if start_sample < end_sample:
+                    segment = audio_raw[start_sample:end_sample]
+                    wav_bytes = _audio_segment_to_wav_bytes(segment, audio_sr)
+                    st.audio(wav_bytes, format="audio/wav")
+                else:
+                    st.warning("片段时间范围无效")
+            else:
+                st.info(f"播放: {sel['start_time']:.1f}s - {sel['end_time']:.1f}s (原始音频未缓存，无法截取)")
 
 
 if __name__ == "__main__":
