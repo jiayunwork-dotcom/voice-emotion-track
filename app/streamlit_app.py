@@ -1,4 +1,5 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import requests
 import numpy as np
 import pandas as pd
@@ -10,6 +11,8 @@ import io
 import json
 import struct
 import wave
+import base64
+from datetime import datetime
 
 API_BASE = os.environ.get("API_BASE_URL", "http://localhost:8000")
 
@@ -93,7 +96,7 @@ def _audio_segment_to_wav_bytes(audio_segment, sr):
     return buf.read()
 
 
-def _build_annotation_data(result, filename):
+def _build_annotation_data(result, filename, analyzed_at=None):
     audio_info = result.get("audio_info", {})
     sentences = result.get("sentences", [])
     summary = result.get("dialogue_summary", {})
@@ -134,14 +137,16 @@ def _build_annotation_data(result, filename):
         "contagion_event_count": len(summary.get("contagion_events", []))
     }
 
-    from datetime import datetime
+    if analyzed_at is None:
+        analyzed_at = datetime.now().isoformat()
+
     annotation = {
         "audio_metadata": {
             "filename": filename or "unknown.wav",
             "duration": audio_info.get("duration", 0.0),
             "sample_rate": audio_info.get("sample_rate", 0),
             "channels": audio_info.get("channels", 0),
-            "analyzed_at": datetime.now().isoformat()
+            "analyzed_at": analyzed_at
         },
         "sentences": sentence_annotations,
         "dialogue_summary": dialogue_summary
@@ -373,8 +378,8 @@ def render_sentence_table(result):
     st.dataframe(df, use_container_width=True)
 
 
-def render_export_buttons(result, filename):
-    annotation = _build_annotation_data(result, filename)
+def render_export_buttons(result, filename, analyzed_at=None):
+    annotation = _build_annotation_data(result, filename, analyzed_at)
 
     col1, col2 = st.columns(2)
     with col1:
@@ -398,8 +403,6 @@ def render_export_buttons(result, filename):
 
 
 def render_dialogue_playback(result, audio_raw, audio_sr, is_dual):
-    import time
-
     sentences = result.get("sentences", [])
     if not sentences or audio_raw is None or audio_sr is None:
         st.info("音频数据不可用，无法回放")
@@ -411,46 +414,59 @@ def render_dialogue_playback(result, audio_raw, audio_sr, is_dual):
         st.session_state["playback_current"] = 0
     if "playback_playing" not in st.session_state:
         st.session_state["playback_playing"] = False
-    if "playback_auto_advance" not in st.session_state:
-        st.session_state["playback_auto_advance"] = False
+
+    query_params = st.experimental_get_query_params()
+    if "pb_adv" in query_params and st.session_state["playback_playing"]:
+        adv = int(query_params["pb_adv"][0])
+        if adv == 1:
+            if st.session_state["playback_current"] < num_sentences - 1:
+                st.session_state["playback_current"] += 1
+            else:
+                st.session_state["playback_playing"] = False
+            st.experimental_set_query_params()
+
+    current_idx = st.session_state["playback_current"]
+    is_playing = st.session_state["playback_playing"]
 
     st.subheader("🎬 对话回放")
 
-    progress_value = (st.session_state["playback_current"] + 1) / num_sentences if num_sentences > 0 else 0
+    progress_value = (current_idx + 1) / num_sentences if num_sentences > 0 else 0
     st.progress(progress_value)
-    st.caption(f"播放进度: {st.session_state['playback_current'] + 1}/{num_sentences}")
+    st.caption(f"播放进度: {current_idx + 1}/{num_sentences}")
 
     col1, col2, col3, col4 = st.columns([1, 1, 1, 2])
     with col1:
         if st.button("▶️ 播放", use_container_width=True, key="play_btn"):
             st.session_state["playback_playing"] = True
-            st.session_state["playback_auto_advance"] = True
             if st.session_state["playback_current"] >= num_sentences:
                 st.session_state["playback_current"] = 0
+            st.rerun()
     with col2:
         if st.button("⏸️ 暂停", use_container_width=True, key="pause_btn"):
             st.session_state["playback_playing"] = False
-            st.session_state["playback_auto_advance"] = False
+            st.experimental_set_query_params()
+            st.rerun()
     with col3:
         if st.button("⏮️ 重置", use_container_width=True, key="reset_btn"):
             st.session_state["playback_playing"] = False
-            st.session_state["playback_auto_advance"] = False
             st.session_state["playback_current"] = 0
+            st.experimental_set_query_params()
+            st.rerun()
     with col4:
         jump_idx = st.number_input(
             "跳转到句子",
             min_value=1,
             max_value=num_sentences,
-            value=st.session_state["playback_current"] + 1,
+            value=current_idx + 1,
             step=1,
             key="jump_input"
         )
         if st.button("跳转", use_container_width=True, key="jump_btn"):
             st.session_state["playback_current"] = jump_idx - 1
             st.session_state["playback_playing"] = False
-            st.session_state["playback_auto_advance"] = False
+            st.experimental_set_query_params()
+            st.rerun()
 
-    current_idx = st.session_state["playback_current"]
     if 0 <= current_idx < num_sentences:
         current_sent = sentences[current_idx]
         emotion = current_sent["emotion"]
@@ -480,10 +496,10 @@ def render_dialogue_playback(result, audio_raw, audio_sr, is_dual):
         if start_sample < end_sample:
             segment = audio_raw[start_sample:end_sample]
             wav_bytes = _audio_segment_to_wav_bytes(segment, audio_sr)
-            st.audio(wav_bytes, format="audio/wav", autoplay=st.session_state["playback_playing"], key=f"audio_{current_idx}")
+            audio_key = f"audio_pb_{current_idx}_{'p' if is_playing else 's'}"
+            st.audio(wav_bytes, format="audio/wav", autoplay=is_playing, key=audio_key)
 
         with st.expander("📈 当前情绪轨迹位置", expanded=True):
-            sentences = result.get("sentences", [])
             summary = result.get("dialogue_summary", {})
             times = [(s["start_time"] + s["end_time"]) / 2 for s in sentences]
             valences = [s["valence"] for s in sentences]
@@ -538,51 +554,48 @@ def render_dialogue_playback(result, audio_raw, audio_sr, is_dual):
     st.markdown("---")
     st.caption("句子列表（当前播放句高亮显示）")
 
-    sentence_list_container = st.container()
-    with sentence_list_container:
-        for i, sent in enumerate(sentences):
-            is_current = (i == current_idx)
-            sent_emotion = sent["emotion"]
-            sent_color = EMOTION_COLORS.get(sent_emotion, "#808080")
-            sent_speaker = sent["speaker_id"]
+    for i, sent in enumerate(sentences):
+        is_current = (i == current_idx)
+        sent_emotion = sent["emotion"]
+        sent_color = EMOTION_COLORS.get(sent_emotion, "#808080")
+        sent_speaker = sent["speaker_id"]
 
-            if is_current:
-                bg_color = "#FFFACD" if not is_dual else ("#E8F4FD" if sent_speaker == "speaker_0" else "#F0FFF0")
-                border_style = f"2px solid {sent_color}"
-            else:
-                bg_color = "#FAFAFA"
-                border_style = "1px solid #E0E0E0"
+        if is_current:
+            bg_color = "#FFFACD" if not is_dual else ("#E8F4FD" if sent_speaker == "speaker_0" else "#F0FFF0")
+            border_style = f"2px solid {sent_color}"
+        else:
+            bg_color = "#FAFAFA"
+            border_style = "1px solid #E0E0E0"
 
-            speaker_label = f"[{sent_speaker}] " if is_dual else ""
-            st.markdown(
-                f'<div style="padding: 8px; margin: 4px 0; border-radius: 5px; '
-                f'background-color: {bg_color}; border: {border_style};">'
-                f'<strong>句{i + 1}</strong> {speaker_label}'
-                f'<span style="color: {sent_color};">● {EMOTION_LABELS_CN.get(sent_emotion, sent_emotion)}</span> '
-                f'| {sent["start_time"]:.1f}s - {sent["end_time"]:.1f}s'
-                f'</div>',
-                unsafe_allow_html=True
-            )
+        speaker_label = f"[{sent_speaker}] " if is_dual else ""
+        st.markdown(
+            f'<div style="padding: 8px; margin: 4px 0; border-radius: 5px; '
+            f'background-color: {bg_color}; border: {border_style};">'
+            f'<strong>句{i + 1}</strong> {speaker_label}'
+            f'<span style="color: {sent_color};">● {EMOTION_LABELS_CN.get(sent_emotion, sent_emotion)}</span> '
+            f'| {sent["start_time"]:.1f}s - {sent["end_time"]:.1f}s'
+            f'</div>',
+            unsafe_allow_html=True
+        )
 
-    if st.session_state["playback_auto_advance"] and st.session_state["playback_playing"]:
+    if is_playing and 0 <= current_idx < num_sentences:
         sent_duration = sentences[current_idx]["end_time"] - sentences[current_idx]["start_time"]
         pause_duration = 0.5
-        total_wait = sent_duration + pause_duration
+        wait_secs = sent_duration + pause_duration
 
-        placeholder = st.empty()
-        placeholder.info(f"⏳ 播放中... 下一句将在 {pause_duration:.1f}秒 后播放")
-
-        time.sleep(min(total_wait, 10))
-        placeholder.empty()
-
-        if st.session_state["playback_current"] < num_sentences - 1:
-            st.session_state["playback_current"] += 1
-            st.rerun()
-        else:
-            st.session_state["playback_playing"] = False
-            st.session_state["playback_auto_advance"] = False
-            st.success("✅ 播放完成")
-            st.rerun()
+        auto_advance_js = f"""
+        <script>
+        (function() {{
+            const waitMs = {int(wait_secs * 1000)};
+            setTimeout(function() {{
+                const currentUrl = new URL(window.parent.location.href);
+                currentUrl.searchParams.set('pb_adv', '1');
+                window.parent.location.href = currentUrl.toString();
+            }}, waitMs);
+        }})();
+        </script>
+        """
+        components.html(auto_advance_js, height=0, width=0)
 
 
 def render_summary(result):
@@ -656,6 +669,7 @@ def main():
 
             if result:
                 st.session_state["analysis_result"] = result
+                st.session_state["analyzed_at"] = datetime.now().isoformat()
 
     if "analysis_result" in st.session_state:
         result = st.session_state["analysis_result"]
@@ -699,7 +713,11 @@ def main():
             render_summary(result)
         with col_export:
             st.subheader("导出标注")
-            render_export_buttons(result, st.session_state.get("audio_filename", "audio.wav"))
+            render_export_buttons(
+                result,
+                st.session_state.get("audio_filename", "audio.wav"),
+                st.session_state.get("analyzed_at")
+            )
 
         with st.expander("🔧 模型性能参考"):
             metrics = result.get("metrics", {})
