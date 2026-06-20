@@ -11,7 +11,7 @@ from datetime import datetime
 from typing import Dict, List, Optional
 
 import numpy as np
-from fastapi import FastAPI, File, UploadFile, Query, HTTPException
+from fastapi import FastAPI, File, UploadFile, Query, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel
@@ -29,6 +29,13 @@ from app.batch_processor import (
     BatchConfig, validate_file_extension, generate_csv_report,
     FileStatus, BatchStatus, list_batches, init_batch_history,
     compare_batches
+)
+from app.stream_processor import (
+    register_session, unregister_session, get_session, list_active_sessions,
+    get_session_results, update_session_activity, set_session_config,
+    increment_frame_count, append_frame_result, analyze_frame_with_timeout,
+    compute_summary, persist_summary, _pcm_bytes_to_float32,
+    VALID_MODEL_MODES, CONFIG_TIMEOUT_SEC
 )
 
 logger = logging.getLogger(__name__)
@@ -728,3 +735,204 @@ async def compare_batches_api(request: BatchCompareRequest):
         significant_diff_count=result["significant_diff_count"],
         threshold=result["threshold"]
     )
+
+
+class StreamSessionInfo(BaseModel):
+    session_id: str
+    status: str
+    frame_count: int
+    connection_duration_seconds: float
+    model_mode: str
+    last_emotion: Optional[str] = None
+    last_active_at: str
+
+
+class StreamSessionListResponse(BaseModel):
+    sessions: List[StreamSessionInfo]
+    total: int
+
+
+@app.get("/api/stream/sessions", response_model=StreamSessionListResponse)
+async def get_stream_sessions():
+    sessions = await list_active_sessions()
+    session_infos = [StreamSessionInfo(**s) for s in sessions]
+    return StreamSessionListResponse(sessions=session_infos, total=len(session_infos))
+
+
+@app.get("/api/stream/sessions/{session_id}/results")
+async def get_stream_session_results(session_id: str):
+    results = await get_session_results(session_id)
+    if results is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return {
+        "session_id": session_id,
+        "frames": [
+            {
+                "seq": r.seq,
+                "emotion": r.emotion,
+                "confidence": r.confidence,
+                "valence": r.valence,
+                "arousal": r.arousal,
+                "timestamp_ms": r.timestamp_ms
+            }
+            for r in results
+        ]
+    }
+
+
+async def _send_json(websocket: WebSocket, data: dict):
+    try:
+        await websocket.send_json(data)
+    except Exception as e:
+        logger.warning(f"Failed to send message: {e}")
+
+
+@app.websocket("/ws/stream")
+async def websocket_stream(websocket: WebSocket,
+                           session_id: str = Query(...),
+                           model_mode: str = Query(...)):
+    await websocket.accept()
+
+    if not session_id:
+        await _send_json(websocket, {"type": "error", "message": "Missing required parameter: session_id"})
+        await websocket.close()
+        return
+
+    if not model_mode or model_mode not in VALID_MODEL_MODES:
+        await _send_json(websocket, {
+            "type": "error",
+            "message": f"Invalid model_mode. Must be one of: {', '.join(sorted(VALID_MODEL_MODES))}"
+        })
+        await websocket.close()
+        return
+
+    err = await register_session(session_id, model_mode)
+    if err:
+        await _send_json(websocket, {"type": "error", "message": err})
+        await websocket.close()
+        return
+
+    classifier = get_classifier(model_mode)
+    seq_counter = 0
+    config_received = False
+    try:
+        try:
+            config_msg = await asyncio.wait_for(
+                websocket.receive_text(),
+                timeout=CONFIG_TIMEOUT_SEC
+            )
+            config_data = json.loads(config_msg)
+            if config_data.get("type") != "config":
+                await _send_json(websocket, {
+                    "type": "error",
+                    "message": "Expected first message to be config. Format: {\"type\":\"config\",\"sample_rate\":16000,\"chunk_duration_ms\":500}"
+                })
+                await websocket.close()
+                return
+
+            sample_rate = config_data.get("sample_rate")
+            chunk_duration_ms = config_data.get("chunk_duration_ms")
+            if not sample_rate or not chunk_duration_ms:
+                await _send_json(websocket, {
+                    "type": "error",
+                    "message": "Config must contain sample_rate and chunk_duration_ms"
+                })
+                await websocket.close()
+                return
+
+            await set_session_config(session_id, sample_rate, chunk_duration_ms)
+            config_received = True
+            await _send_json(websocket, {
+                "type": "config_ack",
+                "session_id": session_id,
+                "sample_rate": sample_rate,
+                "chunk_duration_ms": chunk_duration_ms
+            })
+        except asyncio.TimeoutError:
+            await _send_json(websocket, {
+                "type": "error",
+                "message": f"Config message not received within {CONFIG_TIMEOUT_SEC}s timeout"
+            })
+            await websocket.close()
+            return
+        except json.JSONDecodeError:
+            await _send_json(websocket, {"type": "error", "message": "Invalid JSON in config message"})
+            await websocket.close()
+            return
+
+        while True:
+            try:
+                data = await websocket.receive()
+                if data["type"] == "websocket.disconnect":
+                    break
+
+                if data["type"] == "text":
+                    try:
+                        msg = json.loads(data["text"])
+                        if msg.get("type") == "close":
+                            break
+                    except json.JSONDecodeError:
+                        pass
+                    continue
+
+                if data["type"] != "bytes":
+                    continue
+
+                pcm_bytes = data["bytes"]
+                sess = await get_session(session_id)
+                if sess is None:
+                    break
+
+                if len(pcm_bytes) != sess.expected_bytes:
+                    await _send_json(websocket, {
+                        "type": "warning",
+                        "message": f"Frame size mismatch. Expected {sess.expected_bytes} bytes, got {len(pcm_bytes)} bytes. Frame discarded."
+                    })
+                    continue
+
+                seq_counter += 1
+                await increment_frame_count(session_id)
+                timestamp_ms = (seq_counter - 1) * sess.chunk_duration_ms
+
+                audio_f32 = _pcm_bytes_to_float32(pcm_bytes)
+                result = await analyze_frame_with_timeout(
+                    audio_f32, sess.sample_rate, classifier, seq_counter, timestamp_ms
+                )
+
+                if result is None:
+                    await _send_json(websocket, {"type": "timeout", "seq": seq_counter})
+                else:
+                    await append_frame_result(session_id, result)
+                    await _send_json(websocket, {
+                        "type": "result",
+                        "seq": result.seq,
+                        "emotion": result.emotion,
+                        "confidence": result.confidence,
+                        "valence": result.valence,
+                        "arousal": result.arousal,
+                        "timestamp_ms": result.timestamp_ms
+                    })
+
+                await update_session_activity(session_id)
+
+            except WebSocketDisconnect:
+                break
+            except Exception as e:
+                logger.error(f"WebSocket error in session {session_id}: {e}")
+                break
+
+    finally:
+        sess = await get_session(session_id)
+        if sess is not None:
+            results = await get_session_results(session_id) or []
+            summary = compute_summary(sess)
+            try:
+                await _send_json(websocket, {"type": "summary", **summary})
+            except Exception:
+                pass
+            persist_summary(session_id, summary, results)
+        await unregister_session(session_id)
+        try:
+            await websocket.close()
+        except Exception:
+            pass

@@ -690,6 +690,186 @@ def call_batch_list_api(status=None, page=1, page_size=10):
         return None
 
 
+def call_stream_sessions_api():
+    url = f"{API_BASE}/api/stream/sessions"
+    try:
+        resp = requests.get(url, timeout=5)
+        resp.raise_for_status()
+        return resp.json()
+    except requests.exceptions.RequestException as e:
+        return None
+
+
+def call_stream_session_results_api(session_id):
+    url = f"{API_BASE}/api/stream/sessions/{session_id}/results"
+    try:
+        resp = requests.get(url, timeout=5)
+        resp.raise_for_status()
+        return resp.json()
+    except requests.exceptions.RequestException as e:
+        return None
+
+
+def plot_stream_emotion_trajectory(frames):
+    if not frames:
+        st.info("暂无帧数据")
+        return
+
+    times = [f["timestamp_ms"] / 1000.0 for f in frames]
+    valences = [f["valence"] for f in frames]
+    arousals = [f["arousal"] for f in frames]
+
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                        subplot_titles=("效价 (Valence) 轨迹", "唤醒度 (Arousal) 轨迹"))
+
+    fig.add_trace(go.Scatter(
+        x=times, y=valences, mode='lines+markers',
+        line=dict(color='blue', width=2),
+        marker=dict(size=6, color='blue',
+                    line=dict(color='darkblue', width=1)),
+        name='效价'
+    ), row=1, col=1)
+
+    fig.add_trace(go.Scatter(
+        x=times, y=arousals, mode='lines+markers',
+        line=dict(color='red', width=2),
+        marker=dict(size=6, color='red',
+                    line=dict(color='darkred', width=1)),
+        name='唤醒度'
+    ), row=2, col=1)
+
+    fig.update_layout(height=500, title_text="实时情绪轨迹曲线", showlegend=False)
+    fig.update_yaxes(range=[-1.1, 1.1], row=1, col=1)
+    fig.update_yaxes(range=[-1.1, 1.1], row=2, col=1)
+    fig.update_xaxes(title_text="时间 (秒)", row=2, col=1)
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def render_stream_monitor_page():
+    st.header("📡 实时流式监控")
+
+    health = call_health_api()
+    if health:
+        st.sidebar.success(f"API服务运行中 v{health.get('version', '?')}")
+    else:
+        st.sidebar.error("API服务未连接")
+
+    col_info, col_refresh = st.columns([3, 1])
+    with col_info:
+        st.caption("本页面显示当前活跃的 WebSocket 流式分析会话，每3秒自动刷新")
+    with col_refresh:
+        auto_refresh = st.checkbox("自动刷新", value=True, key="stream_auto_refresh")
+
+    if "stream_selected_session" not in st.session_state:
+        st.session_state["stream_selected_session"] = None
+
+    sessions_data = call_stream_sessions_api()
+    if not sessions_data:
+        st.warning("无法获取会话列表，请检查API服务是否运行")
+        if auto_refresh:
+            time.sleep(3)
+            st.rerun()
+        return
+
+    sessions = sessions_data.get("sessions", [])
+    total = sessions_data.get("total", 0)
+
+    st.metric("当前活跃会话数", total)
+
+    if not sessions:
+        st.info("暂无活跃的流式会话")
+        if auto_refresh:
+            time.sleep(3)
+            st.rerun()
+        return
+
+    for sess in sessions:
+        last_emotion = sess.get("last_emotion")
+        emotion_label = EMOTION_LABELS_CN.get(last_emotion, last_emotion) if last_emotion else "-"
+        emotion_color = EMOTION_COLORS.get(last_emotion, "#808080") if last_emotion else "#CCCCCC"
+
+        is_selected = st.session_state.get("stream_selected_session") == sess["session_id"]
+        expander_label = (
+            f"🆔 {sess['session_id'][:8]}... | "
+            f"📦 {sess['model_mode'].upper()} | "
+            f"🎞️ {sess['frame_count']} 帧 | "
+            f"⏱️ {sess['connection_duration_seconds']:.1f}s | "
+            f"{'🟢' if sess['status'] == 'connected' else '⚪'} {sess['status']}"
+        )
+        if last_emotion:
+            expander_label += f" | <span style='color:{emotion_color};font-weight:bold;'>● {emotion_label}</span>"
+
+        with st.expander(expander_label, expanded=is_selected):
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.write(f"**会话ID**: `{sess['session_id']}`")
+            with col2:
+                st.write(f"**模型**: {sess['model_mode']}")
+            with col3:
+                st.write(f"**帧数**: {sess['frame_count']}")
+            with col4:
+                st.write(f"**时长**: {sess['connection_duration_seconds']:.1f}s")
+
+            col1, col2 = st.columns(2)
+            with col1:
+                st.write(f"**状态**: {sess['status']}")
+            with col2:
+                if last_emotion:
+                    st.markdown(
+                        f"**最近情绪**: <span style='color:{emotion_color};font-weight:bold;'>● {emotion_label}</span>",
+                        unsafe_allow_html=True
+                    )
+                else:
+                    st.write("**最近情绪**: -")
+
+            st.write(f"**最后活跃**: {sess.get('last_active_at', '-')}")
+
+            col_btn1, col_btn2 = st.columns([1, 4])
+            with col_btn1:
+                btn_label = "收起详情" if is_selected else "查看情绪轨迹"
+                if st.button(btn_label, key=f"view_{sess['session_id']}", use_container_width=True):
+                    if is_selected:
+                        st.session_state["stream_selected_session"] = None
+                    else:
+                        st.session_state["stream_selected_session"] = sess["session_id"]
+                    st.rerun()
+
+            if is_selected:
+                st.markdown("---")
+                st.subheader("📈 情绪轨迹")
+                results = call_stream_session_results_api(sess["session_id"])
+                if results and results.get("frames"):
+                    frames = results["frames"]
+                    st.caption(f"共 {len(frames)} 帧分析结果")
+                    plot_stream_emotion_trajectory(frames)
+
+                    with st.expander("📋 帧数据列表", expanded=False):
+                        df_data = []
+                        for f in frames:
+                            df_data.append({
+                                "帧号": f["seq"],
+                                "时间(秒)": f"{f['timestamp_ms'] / 1000.0:.2f}",
+                                "情绪": EMOTION_LABELS_CN.get(f["emotion"], f["emotion"]),
+                                "置信度": f"{f['confidence']:.3f}",
+                                "效价": f"{f['valence']:.3f}",
+                                "唤醒度": f"{f['arousal']:.3f}"
+                            })
+                        df = pd.DataFrame(df_data)
+                        st.dataframe(df, use_container_width=True)
+                else:
+                    st.info("该会话暂无分析结果")
+
+    if auto_refresh:
+        auto_refresh_js = """
+        <script>
+        setTimeout(function() {
+            window.parent.location.reload();
+        }, 3000);
+        </script>
+        """
+        components.html(auto_refresh_js, height=0, width=0)
+
+
 def call_batch_compare_api(batch_id_a, batch_id_b):
     url = f"{API_BASE}/api/batch/compare"
     data = {"batch_id_a": batch_id_a, "batch_id_b": batch_id_b}
@@ -1452,7 +1632,7 @@ def main():
     else:
         st.sidebar.error("API服务未连接")
 
-    tab_single, tab_batch = st.tabs(["🎙️ 单文件分析", "📊 批量对比"])
+    tab_single, tab_batch, tab_stream = st.tabs(["🎙️ 单文件分析", "📊 批量对比", "📡 实时监控"])
 
     with tab_single:
         st.title("🎙️ 语音情感识别与多轮对话情绪追踪")
@@ -1571,6 +1751,9 @@ def main():
 
     with tab_batch:
         render_batch_page()
+
+    with tab_stream:
+        render_stream_monitor_page()
 
 
 if __name__ == "__main__":

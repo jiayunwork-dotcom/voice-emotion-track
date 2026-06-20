@@ -1,0 +1,531 @@
+[
+  {
+    "batch_id": "26c31d1e-4dd2-4119-b97f-e615e6ffab01",
+    "config": {
+      "batch_name": "测试批次A",
+      "dimensions": [
+        "emotion_distribution",
+        "valence_trend"
+      ],
+      "baseline_file": null
+    },
+    "files": [
+      {
+        "file_id": "d99c0875-eb12-439e-aefc-af637c1d6218",
+        "filename": "test_1.wav",
+        "status": "completed",
+        "error": null,
+        "started_at": 1781955946.0675929,
+        "completed_at": 1781955949.6530051,
+        "result_summary": null
+      },
+      {
+        "file_id": "08037cf0-f3f6-49f2-b56b-931c48886787",
+        "filename": "test_2.wav",
+        "status": "completed",
+        "error": null,
+        "started_at": 1781955946.068653,
+        "completed_at": 1781955949.6791072,
+        "result_summary": null
+      },
+      {
+        "file_id": "4c5dbaaa-7f45-4288-b97b-f3e54ff4dcad",
+        "filename": "test_3.wav",
+        "status": "completed",
+        "error": null,
+        "started_at": 1781955946.069824,
+        "completed_at": 1781955950.5335429,
+        "result_summary": null
+      }
+    ],
+    "status": "completed",
+    "started_at": 1781955946.066779,
+    "completed_at": 1781955950.534613,
+    "report": {
+      "meta": {
+        "batch_name": "测试批次A",
+        "batch_id": "26c31d1e-4dd2-4119-b97f-e615e6ffab01",
+        "total_files": 3,
+        "success_count": 3,
+        "failed_count": 0,
+        "total_duration_seconds": 4.47,
+        "baseline_file": null,
+        "selected_dimensions": [
+          "emotion_distribution",
+          "valence_trend"
+        ],
+        "started_at": "2026-06-20T19:45:46.066779",
+        "completed_at": "2026-06-20T19:45:50.534613"
+      },
+      "file_summaries": {
+        "d99c0875-eb12-439e-aefc-af637c1d6218": {
+          "file_id": "d99c0875-eb12-439e-aefc-af637c1d6218",
+          "filename": "test_1.wav",
+          "status": "completed",
+          "processing_time_seconds": 3.59,
+          "audio_info": {
+            "duration": 5.0,
+            "sample_rate": 22050,
+            "channels": 1
+          },
+          "dialogue_summary": {
+            "dominant_emotion": "fear",
+            "valence_std": 0.0,
+            "conflict_density": 0.0,
+            "turning_point_count": 0,
+            "escalation_interval_count": 0,
+            "contagion_event_count": 0
+          }
+        },
+        "08037cf0-f3f6-49f2-b56b-931c48886787": {
+          "file_id": "08037cf0-f3f6-49f2-b56b-931c48886787",
+          "filename": "test_2.wav",
+          "status": "completed",
+          "processing_time_seconds": 3.61,
+          "audio_info": {
+            "duration": 5.0,
+            "sample_rate": 22050,
+            "channels": 1
+          },
+          "dialogue_summary": {
+            "dominant_emotion": "fear",
+            "valence_std": 0.0,
+            "conflict_density": 0.0,
+            "turning_point_count": 0,
+            "escalation_interval_count": 0,
+            "contagion_event_count": 0
+          }
+        },
+        "4c5dbaaa-7f45-4288-b97b-f3e54ff4dcad": {
+          "file_id": "4c5dbaaa-7f45-4288-b97b-f3e54ff4dcad",
+          "filename": "test_3.wav",
+          "status": "completed",
+          "processing_time_seconds": 4.46,
+          "audio_info": {
+            "duration": 5.0,
+            "sample_rate": 22050,
+            "channels": 1
+          },
+          "dialogue_summary": {
+            "dominant_emotion": "fear",
+            "valence_std": 0.0,
+            "conflict_density": 0.0,
+            "turning_point_count": 0,
+            "escalation_interval_count": 0,
+            "contagion_event_count": 0
+          }
+        }
+      },
+      "comparison": {
+        "emotion_distribution": {
+          "distributions": {
+            "d99c0875-eb12-439e-aefc-af637c1d6218": {
+              "neutral": 0.0,
+              "happy": 0.0,
+              "sad": 0.0,
+              "angry": 0.0,
+              "fear": 1.0,
+              "surprise": 0.0,
+              "disgust": 0.0
+            },
+            "08037cf0-f3f6-49f2-b56b-931c48886787": {
+              "neutral": 0.0,
+              "happy": 0.0,
+              "sad": 0.0,
+              "angry": 0.0,
+              "fear": 1.0,
+              "surprise": 0.0,
+              "disgust": 0.0
+            },
+            "4c5dbaaa-7f45-4288-b97b-f3e54ff4dcad": {
+              "neutral": 0.0,
+              "happy": 0.0,
+              "sad": 0.0,
+              "angry": 0.0,
+              "fear": 1.0,
+              "surprise": 0.0,
+              "disgust": 0.0
+            }
+          },
+          "js_divergence_matrix": {
+            "d99c0875-eb12-439e-aefc-af637c1d6218__08037cf0-f3f6-49f2-b56b-931c48886787": 0.0,
+            "d99c0875-eb12-439e-aefc-af637c1d6218__4c5dbaaa-7f45-4288-b97b-f3e54ff4dcad": 0.0,
+            "08037cf0-f3f6-49f2-b56b-931c48886787__4c5dbaaa-7f45-4288-b97b-f3e54ff4dcad": 0.0
+          },
+          "most_divergent_pair": {
+            "file1": null,
+            "file2": null,
+            "js_divergence": 0.0
+          }
+        },
+        "valence_trend": {
+          "trends": {
+            "d99c0875-eb12-439e-aefc-af637c1d6218": {
+              "trend": "stationary",
+              "slope": 0.0,
+              "mean_valence": -0.445,
+              "valence_values": [
+                -0.445
+              ]
+            },
+            "08037cf0-f3f6-49f2-b56b-931c48886787": {
+              "trend": "stationary",
+              "slope": 0.0,
+              "mean_valence": -0.496,
+              "valence_values": [
+                -0.496
+              ]
+            },
+            "4c5dbaaa-7f45-4288-b97b-f3e54ff4dcad": {
+              "trend": "stationary",
+              "slope": 0.0,
+              "mean_valence": -0.599,
+              "valence_values": [
+                -0.599
+              ]
+            }
+          },
+          "mean_slope": 0.0,
+          "anomalous_files": []
+        }
+      }
+    }
+  },
+  {
+    "batch_id": "2c536bbe-0ede-4c9e-b0d6-a7e7a370a500",
+    "config": {
+      "batch_name": "测试批次A",
+      "dimensions": [
+        "emotion_distribution",
+        "valence_trend"
+      ],
+      "baseline_file": null
+    },
+    "files": [
+      {
+        "file_id": "33f5deef-53e8-4366-a953-d422c6f80f78",
+        "filename": "test_1.wav",
+        "status": "completed",
+        "error": null,
+        "started_at": 1781955964.950051,
+        "completed_at": 1781955966.727817,
+        "result_summary": null
+      },
+      {
+        "file_id": "5e3a473a-a09c-4cf5-975f-5c354cdf4460",
+        "filename": "test_2.wav",
+        "status": "completed",
+        "error": null,
+        "started_at": 1781955964.95089,
+        "completed_at": 1781955966.7415638,
+        "result_summary": null
+      },
+      {
+        "file_id": "a785d4e6-2f0d-4750-9756-417ff834cbcf",
+        "filename": "test_3.wav",
+        "status": "completed",
+        "error": null,
+        "started_at": 1781955964.951081,
+        "completed_at": 1781955967.3491251,
+        "result_summary": null
+      }
+    ],
+    "status": "completed",
+    "started_at": 1781955964.9495099,
+    "completed_at": 1781955967.349668,
+    "report": {
+      "meta": {
+        "batch_name": "测试批次A",
+        "batch_id": "2c536bbe-0ede-4c9e-b0d6-a7e7a370a500",
+        "total_files": 3,
+        "success_count": 3,
+        "failed_count": 0,
+        "total_duration_seconds": 2.4,
+        "baseline_file": null,
+        "selected_dimensions": [
+          "emotion_distribution",
+          "valence_trend"
+        ],
+        "started_at": "2026-06-20T19:46:04.949510",
+        "completed_at": "2026-06-20T19:46:07.349668"
+      },
+      "file_summaries": {
+        "33f5deef-53e8-4366-a953-d422c6f80f78": {
+          "file_id": "33f5deef-53e8-4366-a953-d422c6f80f78",
+          "filename": "test_1.wav",
+          "status": "completed",
+          "processing_time_seconds": 1.78,
+          "audio_info": {
+            "duration": 5.0,
+            "sample_rate": 22050,
+            "channels": 1
+          },
+          "dialogue_summary": {
+            "dominant_emotion": "fear",
+            "valence_std": 0.0,
+            "conflict_density": 0.0,
+            "turning_point_count": 0,
+            "escalation_interval_count": 0,
+            "contagion_event_count": 0
+          }
+        },
+        "5e3a473a-a09c-4cf5-975f-5c354cdf4460": {
+          "file_id": "5e3a473a-a09c-4cf5-975f-5c354cdf4460",
+          "filename": "test_2.wav",
+          "status": "completed",
+          "processing_time_seconds": 1.79,
+          "audio_info": {
+            "duration": 5.0,
+            "sample_rate": 22050,
+            "channels": 1
+          },
+          "dialogue_summary": {
+            "dominant_emotion": "fear",
+            "valence_std": 0.0,
+            "conflict_density": 0.0,
+            "turning_point_count": 0,
+            "escalation_interval_count": 0,
+            "contagion_event_count": 0
+          }
+        },
+        "a785d4e6-2f0d-4750-9756-417ff834cbcf": {
+          "file_id": "a785d4e6-2f0d-4750-9756-417ff834cbcf",
+          "filename": "test_3.wav",
+          "status": "completed",
+          "processing_time_seconds": 2.4,
+          "audio_info": {
+            "duration": 5.0,
+            "sample_rate": 22050,
+            "channels": 1
+          },
+          "dialogue_summary": {
+            "dominant_emotion": "fear",
+            "valence_std": 0.0,
+            "conflict_density": 0.0,
+            "turning_point_count": 0,
+            "escalation_interval_count": 0,
+            "contagion_event_count": 0
+          }
+        }
+      },
+      "comparison": {
+        "emotion_distribution": {
+          "distributions": {
+            "33f5deef-53e8-4366-a953-d422c6f80f78": {
+              "neutral": 0.0,
+              "happy": 0.0,
+              "sad": 0.0,
+              "angry": 0.0,
+              "fear": 1.0,
+              "surprise": 0.0,
+              "disgust": 0.0
+            },
+            "5e3a473a-a09c-4cf5-975f-5c354cdf4460": {
+              "neutral": 0.0,
+              "happy": 0.0,
+              "sad": 0.0,
+              "angry": 0.0,
+              "fear": 1.0,
+              "surprise": 0.0,
+              "disgust": 0.0
+            },
+            "a785d4e6-2f0d-4750-9756-417ff834cbcf": {
+              "neutral": 0.0,
+              "happy": 0.0,
+              "sad": 0.0,
+              "angry": 0.0,
+              "fear": 1.0,
+              "surprise": 0.0,
+              "disgust": 0.0
+            }
+          },
+          "js_divergence_matrix": {
+            "33f5deef-53e8-4366-a953-d422c6f80f78__5e3a473a-a09c-4cf5-975f-5c354cdf4460": 0.0,
+            "33f5deef-53e8-4366-a953-d422c6f80f78__a785d4e6-2f0d-4750-9756-417ff834cbcf": 0.0,
+            "5e3a473a-a09c-4cf5-975f-5c354cdf4460__a785d4e6-2f0d-4750-9756-417ff834cbcf": 0.0
+          },
+          "most_divergent_pair": {
+            "file1": null,
+            "file2": null,
+            "js_divergence": 0.0
+          }
+        },
+        "valence_trend": {
+          "trends": {
+            "33f5deef-53e8-4366-a953-d422c6f80f78": {
+              "trend": "stationary",
+              "slope": 0.0,
+              "mean_valence": -0.543,
+              "valence_values": [
+                -0.543
+              ]
+            },
+            "5e3a473a-a09c-4cf5-975f-5c354cdf4460": {
+              "trend": "stationary",
+              "slope": 0.0,
+              "mean_valence": -0.573,
+              "valence_values": [
+                -0.573
+              ]
+            },
+            "a785d4e6-2f0d-4750-9756-417ff834cbcf": {
+              "trend": "stationary",
+              "slope": 0.0,
+              "mean_valence": -0.454,
+              "valence_values": [
+                -0.454
+              ]
+            }
+          },
+          "mean_slope": 0.0,
+          "anomalous_files": []
+        }
+      }
+    }
+  },
+  {
+    "batch_id": "db711a2b-7360-4670-9b64-9648ea168f77",
+    "config": {
+      "batch_name": "测试批次B",
+      "dimensions": [
+        "emotion_distribution",
+        "valence_trend"
+      ],
+      "baseline_file": null
+    },
+    "files": [
+      {
+        "file_id": "4720fefe-03bd-4bee-91d4-4fd16c20f42f",
+        "filename": "test_1.wav",
+        "status": "completed",
+        "error": null,
+        "started_at": 1781955967.7141492,
+        "completed_at": 1781955969.878377,
+        "result_summary": null
+      },
+      {
+        "file_id": "2d304e32-cb8b-47a4-8fdf-3001cb4f352b",
+        "filename": "test_2.wav",
+        "status": "completed",
+        "error": null,
+        "started_at": 1781955967.7143161,
+        "completed_at": 1781955969.8972101,
+        "result_summary": null
+      }
+    ],
+    "status": "completed",
+    "started_at": 1781955967.7139351,
+    "completed_at": 1781955969.8976052,
+    "report": {
+      "meta": {
+        "batch_name": "测试批次B",
+        "batch_id": "db711a2b-7360-4670-9b64-9648ea168f77",
+        "total_files": 2,
+        "success_count": 2,
+        "failed_count": 0,
+        "total_duration_seconds": 2.18,
+        "baseline_file": null,
+        "selected_dimensions": [
+          "emotion_distribution",
+          "valence_trend"
+        ],
+        "started_at": "2026-06-20T19:46:07.713935",
+        "completed_at": "2026-06-20T19:46:09.897605"
+      },
+      "file_summaries": {
+        "4720fefe-03bd-4bee-91d4-4fd16c20f42f": {
+          "file_id": "4720fefe-03bd-4bee-91d4-4fd16c20f42f",
+          "filename": "test_1.wav",
+          "status": "completed",
+          "processing_time_seconds": 2.16,
+          "audio_info": {
+            "duration": 5.0,
+            "sample_rate": 22050,
+            "channels": 1
+          },
+          "dialogue_summary": {
+            "dominant_emotion": "fear",
+            "valence_std": 0.0,
+            "conflict_density": 0.0,
+            "turning_point_count": 0,
+            "escalation_interval_count": 0,
+            "contagion_event_count": 0
+          }
+        },
+        "2d304e32-cb8b-47a4-8fdf-3001cb4f352b": {
+          "file_id": "2d304e32-cb8b-47a4-8fdf-3001cb4f352b",
+          "filename": "test_2.wav",
+          "status": "completed",
+          "processing_time_seconds": 2.18,
+          "audio_info": {
+            "duration": 5.0,
+            "sample_rate": 22050,
+            "channels": 1
+          },
+          "dialogue_summary": {
+            "dominant_emotion": "fear",
+            "valence_std": 0.0,
+            "conflict_density": 0.0,
+            "turning_point_count": 0,
+            "escalation_interval_count": 0,
+            "contagion_event_count": 0
+          }
+        }
+      },
+      "comparison": {
+        "emotion_distribution": {
+          "distributions": {
+            "4720fefe-03bd-4bee-91d4-4fd16c20f42f": {
+              "neutral": 0.0,
+              "happy": 0.0,
+              "sad": 0.0,
+              "angry": 0.0,
+              "fear": 1.0,
+              "surprise": 0.0,
+              "disgust": 0.0
+            },
+            "2d304e32-cb8b-47a4-8fdf-3001cb4f352b": {
+              "neutral": 0.0,
+              "happy": 0.0,
+              "sad": 0.0,
+              "angry": 0.0,
+              "fear": 1.0,
+              "surprise": 0.0,
+              "disgust": 0.0
+            }
+          },
+          "js_divergence_matrix": {
+            "4720fefe-03bd-4bee-91d4-4fd16c20f42f__2d304e32-cb8b-47a4-8fdf-3001cb4f352b": 0.0
+          },
+          "most_divergent_pair": {
+            "file1": null,
+            "file2": null,
+            "js_divergence": 0.0
+          }
+        },
+        "valence_trend": {
+          "trends": {
+            "4720fefe-03bd-4bee-91d4-4fd16c20f42f": {
+              "trend": "stationary",
+              "slope": 0.0,
+              "mean_valence": -0.491,
+              "valence_values": [
+                -0.491
+              ]
+            },
+            "2d304e32-cb8b-47a4-8fdf-3001cb4f352b": {
+              "trend": "stationary",
+              "slope": 0.0,
+              "mean_valence": -0.419,
+              "valence_values": [
+                -0.419
+              ]
+            }
+          },
+          "mean_slope": 0.0,
+          "anomalous_files": []
+        }
+      }
+    }
+  }
+]
