@@ -3,7 +3,7 @@ import librosa
 import soundfile as sf
 import tempfile
 import os
-from pydub import AudioSegment
+from pydub import AudioSegment as PydubAudioSegment
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
@@ -11,7 +11,7 @@ from app.config import get_config
 
 
 @dataclass
-class AudioSegment:
+class AudioSegmentData:
     start_time: float
     end_time: float
     audio_data: np.ndarray
@@ -23,12 +23,12 @@ class AudioInfo:
     duration: float
     sample_rate: int
     channels: int
-    segments: List[AudioSegment] = field(default_factory=list)
+    segments: List[AudioSegmentData] = field(default_factory=list)
 
 
 def load_audio(file_path: str, target_sr: Optional[int] = None) -> Tuple[np.ndarray, int, int]:
     if file_path.lower().endswith(".mp3"):
-        audio = AudioSegment.from_mp3(file_path)
+        audio = PydubAudioSegment.from_mp3(file_path)
         channels = audio.channels
         samples = np.array(audio.get_array_of_samples(), dtype=np.float32)
         if channels == 2:
@@ -45,7 +45,7 @@ def load_audio(file_path: str, target_sr: Optional[int] = None) -> Tuple[np.ndar
             sr = target_sr
         return samples, sr, channels
 
-    audio_data, sr = sf.read(file_path, dtype="float32")
+    audio_data, sr = sf.read(file_path, dtype="float32")  # WAV/FLAC etc.
     if audio_data.ndim == 1:
         channels = 1
         audio_data = audio_data.reshape((1, -1))
@@ -106,14 +106,14 @@ def filter_short_segments(segments: List[Tuple[float, float]],
 
 def segments_to_audio_segments(audio: np.ndarray, sr: int,
                                time_segments: List[Tuple[float, float]],
-                               speaker_id: str = "speaker_0") -> List[AudioSegment]:
+                               speaker_id: str = "speaker_0") -> List[AudioSegmentData]:
     result = []
     for start, end in time_segments:
         start_sample = int(start * sr)
         end_sample = int(end * sr)
         end_sample = min(end_sample, len(audio))
         seg_audio = audio[start_sample:end_sample]
-        result.append(AudioSegment(
+        result.append(AudioSegmentData(
             start_time=round(start, 3),
             end_time=round(end, 3),
             audio_data=seg_audio,
