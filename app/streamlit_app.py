@@ -1029,8 +1029,14 @@ def render_batch_page():
 
             if progress["percentage"] < 100:
                 st.info("⏳ 正在处理中，页面将自动刷新...")
-                time.sleep(3)
-                st.rerun()
+                auto_refresh_js = """
+                <script>
+                setTimeout(function() {
+                    window.parent.location.reload();
+                }, 3000);
+                </script>
+                """
+                components.html(auto_refresh_js, height=0, width=0)
             else:
                 st.success("✅ 所有文件处理完成!")
 

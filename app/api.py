@@ -510,7 +510,10 @@ async def submit_batch(
         )
 
     if not batch_config_obj.dimensions:
-        raise HTTPException(status_code=400, detail="At least one dimension must be selected")
+        raise HTTPException(
+            status_code=400,
+            detail=f"At least one dimension must be selected. Valid dimensions: {', '.join(sorted(VALID_DIMENSIONS))}"
+        )
 
     invalid_dims = [d for d in batch_config_obj.dimensions if d not in VALID_DIMENSIONS]
     if invalid_dims:

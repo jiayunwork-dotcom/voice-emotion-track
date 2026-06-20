@@ -57,3 +57,7 @@ coverage/
 htmlcov/
 .coverage
 *.lcov
+
+# Test artifacts
+test_audio/
+test_batch.py
