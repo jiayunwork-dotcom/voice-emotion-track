@@ -789,8 +789,8 @@ async def _send_json(websocket: WebSocket, data: dict):
 
 @app.websocket("/ws/stream")
 async def websocket_stream(websocket: WebSocket,
-                           session_id: str = Query(...),
-                           model_mode: str = Query(...)):
+                           session_id: Optional[str] = Query(None),
+                           model_mode: Optional[str] = Query(None)):
     await websocket.accept()
 
     if not session_id:
@@ -866,7 +866,7 @@ async def websocket_stream(websocket: WebSocket,
                 if data["type"] == "websocket.disconnect":
                     break
 
-                if data["type"] == "text":
+                if "text" in data:
                     try:
                         msg = json.loads(data["text"])
                         if msg.get("type") == "close":
@@ -875,7 +875,7 @@ async def websocket_stream(websocket: WebSocket,
                         pass
                     continue
 
-                if data["type"] != "bytes":
+                if "bytes" not in data:
                     continue
 
                 pcm_bytes = data["bytes"]
