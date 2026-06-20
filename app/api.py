@@ -35,6 +35,7 @@ from app.stream_processor import (
     get_session_results, update_session_activity, set_session_config,
     increment_frame_count, append_frame_result, analyze_frame_with_timeout,
     compute_summary, persist_summary, _pcm_bytes_to_float32,
+    increment_timeout_count,
     VALID_MODEL_MODES, CONFIG_TIMEOUT_SEC
 )
 
@@ -741,6 +742,8 @@ class StreamSessionInfo(BaseModel):
     session_id: str
     status: str
     frame_count: int
+    analyzed_frames: int
+    timeout_frames: int
     connection_duration_seconds: float
     model_mode: str
     last_emotion: Optional[str] = None
@@ -900,6 +903,7 @@ async def websocket_stream(websocket: WebSocket,
                 )
 
                 if result is None:
+                    await increment_timeout_count(session_id)
                     await _send_json(websocket, {"type": "timeout", "seq": seq_counter})
                 else:
                     await append_frame_result(session_id, result)

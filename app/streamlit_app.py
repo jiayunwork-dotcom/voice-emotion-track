@@ -788,11 +788,15 @@ def render_stream_monitor_page():
         emotion_label = EMOTION_LABELS_CN.get(last_emotion, last_emotion) if last_emotion else "-"
         emotion_color = EMOTION_COLORS.get(last_emotion, "#808080") if last_emotion else "#CCCCCC"
 
+        analyzed = sess.get("analyzed_frames", 0)
+        timeout = sess.get("timeout_frames", 0)
+        total = sess["frame_count"]
+
         is_selected = st.session_state.get("stream_selected_session") == sess["session_id"]
         expander_label = (
             f"🆔 {sess['session_id'][:8]}... | "
             f"📦 {sess['model_mode'].upper()} | "
-            f"🎞️ {sess['frame_count']} 帧 | "
+            f"🎞️ {total}帧(✓{analyzed}/⏱{timeout}) | "
             f"⏱️ {sess['connection_duration_seconds']:.1f}s | "
             f"{'🟢' if sess['status'] == 'connected' else '⚪'} {sess['status']}"
         )
@@ -806,14 +810,20 @@ def render_stream_monitor_page():
             with col2:
                 st.write(f"**模型**: {sess['model_mode']}")
             with col3:
-                st.write(f"**帧数**: {sess['frame_count']}")
+                st.write(f"**总帧数**: {total}")
             with col4:
                 st.write(f"**时长**: {sess['connection_duration_seconds']:.1f}s")
 
-            col1, col2 = st.columns(2)
+            col1, col2, col3 = st.columns(3)
             with col1:
                 st.write(f"**状态**: {sess['status']}")
             with col2:
+                st.write(f"**分析成功**: ✅ {analyzed}")
+            with col3:
+                st.write(f"**超时跳过**: ⏱ {timeout}")
+
+            col1, col2 = st.columns(2)
+            with col1:
                 if last_emotion:
                     st.markdown(
                         f"**最近情绪**: <span style='color:{emotion_color};font-weight:bold;'>● {emotion_label}</span>",
@@ -821,8 +831,8 @@ def render_stream_monitor_page():
                     )
                 else:
                     st.write("**最近情绪**: -")
-
-            st.write(f"**最后活跃**: {sess.get('last_active_at', '-')}")
+            with col2:
+                st.write(f"**最后活跃**: {sess.get('last_active_at', '-')}")
 
             col_btn1, col_btn2 = st.columns([1, 4])
             with col_btn1:

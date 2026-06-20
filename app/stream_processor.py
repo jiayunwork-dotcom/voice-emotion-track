@@ -4,6 +4,7 @@ import os
 import time
 import logging
 import numpy as np
+import librosa
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -44,6 +45,8 @@ class StreamSession:
     chunk_duration_ms: Optional[int] = None
     expected_bytes: Optional[int] = None
     frame_count: int = 0
+    analyzed_frames: int = 0
+    timeout_frames: int = 0
     started_at: float = field(default_factory=time.time)
     last_active_at: float = field(default_factory=time.time)
     results: List[FrameResult] = field(default_factory=list)
@@ -64,10 +67,54 @@ def _pcm_bytes_to_float32(pcm_bytes: bytes) -> np.ndarray:
     return arr.astype(np.float32) / 32768.0
 
 
+def _fast_extract_features(audio: np.ndarray, sr: int,
+                           start_time: float, end_time: float,
+                           speaker_id: str) -> "SegmentFeatures":
+    from app.feature_extractor import SegmentFeatures
+    feat = SegmentFeatures(start_time=start_time, end_time=end_time, speaker_id=speaker_id)
+
+    n_fft = min(512, len(audio))
+    hop_length = n_fft // 4
+
+    if len(audio) < n_fft:
+        audio = np.pad(audio, (0, n_fft - len(audio)))
+
+    rms = librosa.feature.rms(y=audio, frame_length=n_fft, hop_length=hop_length)[0]
+    zcr = librosa.feature.zero_crossing_rate(audio, frame_length=n_fft, hop_length=hop_length)[0]
+    sc = librosa.feature.spectral_centroid(y=audio, sr=sr, n_fft=n_fft, hop_length=hop_length)[0]
+    sb = librosa.feature.spectral_bandwidth(y=audio, sr=sr, n_fft=n_fft, hop_length=hop_length)[0]
+
+    def _quick_stats(arr: np.ndarray) -> Dict[str, float]:
+        valid = arr[~np.isnan(arr)]
+        if len(valid) == 0:
+            return {"mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0}
+        return {
+            "mean": float(np.mean(valid)),
+            "std": float(np.std(valid)),
+            "min": float(np.min(valid)),
+            "max": float(np.max(valid))
+        }
+
+    aggregated = {}
+    for prefix, data in [("rms", rms), ("zcr", zcr), ("sc", sc), ("sb", sb)]:
+        stats = _quick_stats(data)
+        for k, v in stats.items():
+            aggregated[f"{prefix}_{k}"] = v
+
+    for i in range(200):
+        if f"dim{i}_mean" not in aggregated:
+            aggregated[f"dim{i}_mean"] = 0.0
+            aggregated[f"dim{i}_std"] = 0.0
+            aggregated[f"dim{i}_min"] = 0.0
+            aggregated[f"dim{i}_max"] = 0.0
+
+    feat.aggregated = aggregated
+    return feat
+
+
 def _analyze_frame_sync(audio_f32: np.ndarray, sr: int, classifier,
                         seq: int, timestamp_ms: int) -> FrameResult:
-    from app.feature_extractor import extract_features
-    features = extract_features(audio_f32, sr, 0.0, len(audio_f32) / sr, "speaker_0")
+    features = _fast_extract_features(audio_f32, sr, 0.0, len(audio_f32) / sr, "speaker_0")
     result = classifier.predict(audio_f32, sr, features)
     return FrameResult(
         seq=seq,
@@ -131,6 +178,8 @@ async def list_active_sessions() -> List[dict]:
                 "session_id": sid,
                 "status": sess.status,
                 "frame_count": sess.frame_count,
+                "analyzed_frames": sess.analyzed_frames,
+                "timeout_frames": sess.timeout_frames,
                 "connection_duration_seconds": round(now - sess.started_at, 2),
                 "model_mode": sess.model_mode,
                 "last_emotion": last_emotion,
@@ -176,6 +225,13 @@ async def append_frame_result(session_id: str, result: FrameResult):
     async with _sessions_lock:
         if session_id in _sessions:
             _sessions[session_id].results.append(result)
+            _sessions[session_id].analyzed_frames += 1
+
+
+async def increment_timeout_count(session_id: str):
+    async with _sessions_lock:
+        if session_id in _sessions:
+            _sessions[session_id].timeout_frames += 1
 
 
 def compute_summary(session: StreamSession) -> dict:
@@ -185,6 +241,8 @@ def compute_summary(session: StreamSession) -> dict:
             "valence_mean": 0.0,
             "arousal_mean": 0.0,
             "total_frames": session.frame_count,
+            "analyzed_frames": session.analyzed_frames,
+            "timeout_frames": session.timeout_frames,
             "duration_seconds": round(session.frame_count * (session.chunk_duration_ms or 0) / 1000.0, 2)
         }
 
@@ -202,6 +260,8 @@ def compute_summary(session: StreamSession) -> dict:
         "valence_mean": round(float(np.mean(valences)), 4),
         "arousal_mean": round(float(np.mean(arousals)), 4),
         "total_frames": session.frame_count,
+        "analyzed_frames": session.analyzed_frames,
+        "timeout_frames": session.timeout_frames,
         "duration_seconds": round(duration, 2)
     }
 

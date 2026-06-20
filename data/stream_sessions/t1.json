@@ -1,0 +1,12 @@
+{
+  "session_id": "t1",
+  "summary": {
+    "dominant_emotion": "neutral",
+    "valence_mean": 0.0,
+    "arousal_mean": 0.0,
+    "total_frames": 1,
+    "duration_seconds": 0.5
+  },
+  "frames": [],
+  "saved_at": "2026-06-20T22:45:49.215383"
+}
