@@ -8,6 +8,8 @@ import json
 import csv
 import io
 import math
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Any, Union
@@ -74,11 +76,14 @@ class BatchTask:
 
 _batches_store: Dict[str, BatchTask] = {}
 _batches_lock = asyncio.Lock()
+_file_status_lock = threading.Lock()
 
 MAX_BATCH_CONCURRENT = 3
 _batch_semaphore = asyncio.Semaphore(MAX_BATCH_CONCURRENT)
 _batch_queue_count = 0
 _batch_queue_lock = asyncio.Lock()
+
+MAX_FILE_CONCURRENT = 3
 
 SUPPORTED_EXTENSIONS = {".wav", ".mp3", ".flac", ".ogg", ".m4a"}
 
@@ -625,6 +630,41 @@ def _release_batch_slot():
     _batch_semaphore.release()
 
 
+def _process_single_batch_file(batch_file: BatchFile, timeout: float) -> None:
+    try:
+        with _file_status_lock:
+            batch_file.status = FileStatus.PROCESSING
+            batch_file.started_at = time.time()
+
+        result = _process_single_file_sync(
+            batch_file.temp_path, "svm",
+            batch_file.filename.lower().endswith("_dual.wav"),
+            timeout
+        )
+
+        with _file_status_lock:
+            batch_file.result = result
+            batch_file.status = FileStatus.COMPLETED
+            batch_file.completed_at = time.time()
+
+    except TimeoutError:
+        with _file_status_lock:
+            batch_file.status = FileStatus.FAILED
+            batch_file.error = f"Processing timed out after {timeout}s"
+            batch_file.completed_at = time.time()
+    except Exception as e:
+        logger.exception(f"Failed to process file {batch_file.filename}")
+        with _file_status_lock:
+            batch_file.status = FileStatus.FAILED
+            batch_file.error = str(e)
+            batch_file.completed_at = time.time()
+    finally:
+        try:
+            os.unlink(batch_file.temp_path)
+        except Exception:
+            pass
+
+
 async def process_batch_task(batch: BatchTask):
     config = get_config()
     timeout = config["request_timeout_seconds"]
@@ -640,42 +680,25 @@ async def process_batch_task(batch: BatchTask):
         batch.status = BatchStatus.PROCESSING
         batch.started_at = time.time()
 
-        for batch_file in batch.files:
-            try:
-                batch_file.status = FileStatus.PROCESSING
-                batch_file.started_at = time.time()
-
-                loop = asyncio.get_event_loop()
-                result = await asyncio.wait_for(
-                    loop.run_in_executor(
-                        None, _process_single_file_sync,
-                        batch_file.temp_path, "svm",
-                        batch_file.filename.lower().endswith("_dual.wav"),
-                        timeout
-                    ),
-                    timeout=timeout + 10
+        loop = asyncio.get_event_loop()
+        with ThreadPoolExecutor(max_workers=MAX_FILE_CONCURRENT) as executor:
+            futures = []
+            for batch_file in batch.files:
+                future = loop.run_in_executor(
+                    executor, _process_single_batch_file, batch_file, timeout
                 )
-
-                batch_file.result = result
-                batch_file.status = FileStatus.COMPLETED
-                batch_file.completed_at = time.time()
-
-            except asyncio.TimeoutError:
-                batch_file.status = FileStatus.FAILED
-                batch_file.error = f"Processing timed out after {timeout}s"
-                batch_file.completed_at = time.time()
-            except Exception as e:
-                logger.exception(f"Failed to process file {batch_file.filename}")
-                batch_file.status = FileStatus.FAILED
-                batch_file.error = str(e)
-                batch_file.completed_at = time.time()
-            finally:
+                futures.append(future)
+            for future in asyncio.as_completed(futures):
                 try:
-                    os.unlink(batch_file.temp_path)
-                except Exception:
-                    pass
+                    await future
+                except Exception as e:
+                    logger.exception(f"Unexpected error in file processing task")
 
-        batch.status = BatchStatus.COMPLETED
+        all_failed = all(f.status == FileStatus.FAILED for f in batch.files)
+        if all_failed and len(batch.files) > 0:
+            batch.status = BatchStatus.FAILED
+        else:
+            batch.status = BatchStatus.COMPLETED
         batch.completed_at = time.time()
 
         try:
@@ -695,6 +718,8 @@ async def process_batch_task(batch: BatchTask):
                     )
                 }
             }
+
+        persist_batch(batch.batch_id)
 
     finally:
         _release_batch_slot()
@@ -772,3 +797,287 @@ def get_batch_status(batch_id: str) -> Optional[dict]:
             for f in batch.files
         ]
     }
+
+
+def _get_persistence_path() -> str:
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    data_dir = os.path.join(base_dir, "data")
+    os.makedirs(data_dir, exist_ok=True)
+    return os.path.join(data_dir, "batch_history.json")
+
+
+def _batch_to_dict(batch: BatchTask) -> dict:
+    files = []
+    for f in batch.files:
+        files.append({
+            "file_id": f.file_id,
+            "filename": f.filename,
+            "status": f.status.value,
+            "error": f.error,
+            "started_at": f.started_at,
+            "completed_at": f.completed_at,
+            "result_summary": None
+        })
+    return {
+        "batch_id": batch.batch_id,
+        "config": {
+            "batch_name": batch.config.batch_name,
+            "dimensions": batch.config.dimensions,
+            "baseline_file": batch.config.baseline_file
+        },
+        "files": files,
+        "status": batch.status.value,
+        "started_at": batch.started_at,
+        "completed_at": batch.completed_at,
+        "report": batch.report
+    }
+
+
+def _dict_to_batch(data: dict) -> BatchTask:
+    config = BatchConfig(
+        batch_name=data["config"]["batch_name"],
+        dimensions=data["config"]["dimensions"],
+        baseline_file=data["config"].get("baseline_file")
+    )
+    files = []
+    for f_data in data["files"]:
+        files.append(BatchFile(
+            file_id=f_data["file_id"],
+            filename=f_data["filename"],
+            temp_path="",
+            status=FileStatus(f_data["status"]),
+            error=f_data.get("error"),
+            started_at=f_data.get("started_at"),
+            completed_at=f_data.get("completed_at"),
+            result=None
+        ))
+    batch = BatchTask(
+        batch_id=data["batch_id"],
+        config=config,
+        files=files,
+        status=BatchStatus(data["status"]),
+        started_at=data.get("started_at"),
+        completed_at=data.get("completed_at"),
+        report=data.get("report")
+    )
+    return batch
+
+
+def _save_batches_to_disk() -> None:
+    try:
+        path = _get_persistence_path()
+        data = []
+        for batch_id, batch in _batches_store.items():
+            if batch.status in (BatchStatus.COMPLETED, BatchStatus.FAILED):
+                data.append(_batch_to_dict(batch))
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.exception(f"Failed to save batch history to disk: {e}")
+
+
+def _load_batches_from_disk() -> None:
+    try:
+        path = _get_persistence_path()
+        if not os.path.exists(path):
+            return
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        for batch_data in data:
+            batch = _dict_to_batch(batch_data)
+            if batch.batch_id not in _batches_store:
+                _batches_store[batch.batch_id] = batch
+        logger.info(f"Loaded {len(data)} batches from disk")
+    except Exception as e:
+        logger.exception(f"Failed to load batch history from disk: {e}")
+
+
+def list_batches(
+    status: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 10
+) -> dict:
+    all_batches = list(_batches_store.values())
+
+    if status:
+        try:
+            target_status = BatchStatus(status)
+            all_batches = [b for b in all_batches if b.status == target_status]
+        except ValueError:
+            pass
+
+    all_batches.sort(key=lambda b: b.started_at or 0, reverse=True)
+
+    total = len(all_batches)
+    start = (page - 1) * page_size
+    end = start + page_size
+    paginated = all_batches[start:end]
+
+    items = []
+    for b in paginated:
+        items.append({
+            "batch_id": b.batch_id,
+            "batch_name": b.config.batch_name,
+            "file_count": len(b.files),
+            "status": b.status.value,
+            "started_at": datetime.fromtimestamp(b.started_at).isoformat() if b.started_at else None,
+            "completed_at": datetime.fromtimestamp(b.completed_at).isoformat() if b.completed_at else None,
+            "success_count": sum(1 for f in b.files if f.status == FileStatus.COMPLETED),
+            "failed_count": sum(1 for f in b.files if f.status == FileStatus.FAILED)
+        })
+
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": math.ceil(total / page_size) if total > 0 else 0
+    }
+
+
+def persist_batch(batch_id: str) -> None:
+    _save_batches_to_disk()
+
+
+def init_batch_history() -> None:
+    _load_batches_from_disk()
+
+
+SIGNIFICANT_DIFF_THRESHOLD = 0.15
+
+
+def _get_batch_aggregated_metrics(batch: BatchTask) -> dict:
+    if not batch.report or "comparison" not in batch.report:
+        return {}
+
+    comparison = batch.report["comparison"]
+    metrics = {}
+
+    if "emotion_distribution" in comparison:
+        dists = comparison["emotion_distribution"]["distributions"]
+        if dists:
+            all_emotions = {}
+            for emotion in EMOTION_LABELS:
+                values = [d[emotion] for d in dists.values() if emotion in d]
+                if values:
+                    all_emotions[emotion] = float(np.mean(values))
+            metrics["emotion_distribution"] = all_emotions
+
+    if "valence_trend" in comparison:
+        trends = comparison["valence_trend"]["trends"]
+        if trends:
+            slopes = [t["slope"] for t in trends.values()]
+            mean_valences = [t["mean_valence"] for t in trends.values()]
+            metrics["valence_trend"] = {
+                "mean_slope": float(np.mean(slopes)) if slopes else 0.0,
+                "std_slope": float(np.std(slopes)) if len(slopes) > 1 else 0.0,
+                "mean_valence": float(np.mean(mean_valences)) if mean_valences else 0.0
+            }
+
+    if "arousal_pattern" in comparison:
+        patterns = comparison["arousal_pattern"]["patterns"]
+        if patterns:
+            stds = [p["arousal_std"] for p in patterns.values()]
+            means = [p["mean_arousal"] for p in patterns.values()]
+            escalation_counts = [p["escalation_interval_count"] for p in patterns.values()]
+            sharp_counts = [p["sharp_change_count"] for p in patterns.values()]
+            metrics["arousal_pattern"] = {
+                "mean_arousal_std": float(np.mean(stds)) if stds else 0.0,
+                "mean_arousal": float(np.mean(means)) if means else 0.0,
+                "avg_escalation_count": float(np.mean(escalation_counts)) if escalation_counts else 0.0,
+                "avg_sharp_change_count": float(np.mean(sharp_counts)) if sharp_counts else 0.0
+            }
+
+    if "speaker_similarity" in comparison:
+        sync_data = comparison["speaker_similarity"]["speaker_sync"]
+        if sync_data:
+            sync_scores = []
+            for d in sync_data.values():
+                if d.get("synchronization"):
+                    sync_scores.append(d["synchronization"]["synchronization_score"])
+            if sync_scores:
+                metrics["speaker_similarity"] = {
+                    "mean_sync_score": float(np.mean(sync_scores)),
+                    "std_sync_score": float(np.std(sync_scores)) if len(sync_scores) > 1 else 0.0
+                }
+
+    return metrics
+
+
+def _flatten_metrics(metrics: dict) -> Dict[str, float]:
+    flat = {}
+    for dim, dim_metrics in metrics.items():
+        if isinstance(dim_metrics, dict):
+            for key, value in dim_metrics.items():
+                if isinstance(value, (int, float)):
+                    flat[f"{dim}.{key}"] = float(value)
+                elif isinstance(value, dict):
+                    for sub_key, sub_value in value.items():
+                        if isinstance(sub_value, (int, float)):
+                            flat[f"{dim}.{key}.{sub_key}"] = float(sub_value)
+    return flat
+
+
+def compare_batches(batch_id_a: str, batch_id_b: str) -> Optional[dict]:
+    batch_a = _batches_store.get(batch_id_a)
+    batch_b = _batches_store.get(batch_id_b)
+
+    if not batch_a or not batch_b:
+        return None
+
+    if batch_a.status != BatchStatus.COMPLETED or batch_b.status != BatchStatus.COMPLETED:
+        return None
+
+    metrics_a = _get_batch_aggregated_metrics(batch_a)
+    metrics_b = _get_batch_aggregated_metrics(batch_b)
+
+    flat_a = _flatten_metrics(metrics_a)
+    flat_b = _flatten_metrics(metrics_b)
+
+    all_keys = sorted(set(list(flat_a.keys()) + list(flat_b.keys())))
+
+    comparisons = []
+    significant_diffs = []
+
+    for key in all_keys:
+        val_a = flat_a.get(key, 0.0)
+        val_b = flat_b.get(key, 0.0)
+        diff = val_b - val_a
+        abs_diff = abs(diff)
+        is_significant = abs_diff > SIGNIFICANT_DIFF_THRESHOLD
+
+        comparison = {
+            "metric": key,
+            "batch_a_value": round(val_a, 6),
+            "batch_b_value": round(val_b, 6),
+            "difference": round(diff, 6),
+            "abs_difference": round(abs_diff, 6),
+            "is_significant": is_significant
+        }
+        comparisons.append(comparison)
+
+        if is_significant:
+            significant_diffs.append(key)
+
+    result = {
+        "batch_a": {
+            "batch_id": batch_a.batch_id,
+            "batch_name": batch_a.config.batch_name,
+            "file_count": len(batch_a.files),
+            "completed_at": datetime.fromtimestamp(batch_a.completed_at).isoformat() if batch_a.completed_at else None,
+            "metrics": metrics_a
+        },
+        "batch_b": {
+            "batch_id": batch_b.batch_id,
+            "batch_name": batch_b.config.batch_name,
+            "file_count": len(batch_b.files),
+            "completed_at": datetime.fromtimestamp(batch_b.completed_at).isoformat() if batch_b.completed_at else None,
+            "metrics": metrics_b
+        },
+        "comparisons": comparisons,
+        "significant_diffs": significant_diffs,
+        "significant_diff_count": len(significant_diffs),
+        "threshold": SIGNIFICANT_DIFF_THRESHOLD
+    }
+
+    return result

@@ -677,6 +677,36 @@ def call_batch_report_api(batch_id, format="json"):
         return {"status": "error", "data": str(e)}
 
 
+def call_batch_list_api(status=None, page=1, page_size=10):
+    url = f"{API_BASE}/api/batch/list"
+    params = {"page": page, "page_size": page_size}
+    if status:
+        params["status"] = status
+    try:
+        resp = requests.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+    except requests.exceptions.RequestException as e:
+        return None
+
+
+def call_batch_compare_api(batch_id_a, batch_id_b):
+    url = f"{API_BASE}/api/batch/compare"
+    data = {"batch_id_a": batch_id_a, "batch_id_b": batch_id_b}
+    try:
+        resp = requests.post(url, json=data, timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+    except requests.exceptions.RequestException as e:
+        if hasattr(e, 'response') and e.response is not None:
+            try:
+                detail = e.response.json().get("detail", e.response.text)
+                return {"error": detail}
+            except Exception:
+                return {"error": e.response.text}
+        return {"error": str(e)}
+
+
 def plot_batch_emotion_radar(report):
     comparison = report.get("comparison", {})
     if "emotion_distribution" not in comparison:
@@ -913,6 +943,262 @@ def plot_similarity_matrix(report):
     st.plotly_chart(fig, use_container_width=True)
 
 
+def render_history_section():
+    st.subheader("📜 历史批次")
+
+    col_filter, col_refresh = st.columns([3, 1])
+    with col_filter:
+        status_filter = st.selectbox(
+            "状态筛选",
+            ["全部", "completed", "failed", "processing", "queued"],
+            format_func=lambda x: {
+                "全部": "全部",
+                "completed": "✅ 已完成",
+                "failed": "❌ 失败",
+                "processing": "⚙️ 处理中",
+                "queued": "⏳ 排队中"
+            }.get(x, x),
+            key="history_status_filter"
+        )
+    with col_refresh:
+        if st.button("🔄 刷新列表", use_container_width=True, key="refresh_history"):
+            st.rerun()
+
+    status_param = None if status_filter == "全部" else status_filter
+    batch_list = call_batch_list_api(status=status_param, page=1, page_size=10)
+
+    if not batch_list:
+        st.warning("无法加载历史批次列表")
+        return
+
+    items = batch_list.get("items", [])
+    if not items:
+        st.info("暂无历史批次")
+        return
+
+    st.caption(f"共 {batch_list.get('total', 0)} 个批次")
+
+    for item in items:
+        status_cn = {
+            "completed": "✅ 已完成",
+            "failed": "❌ 失败",
+            "processing": "⚙️ 处理中",
+            "queued": "⏳ 排队中"
+        }.get(item["status"], item["status"])
+
+        with st.expander(
+            f"{item['batch_name']} | {status_cn} | {item['file_count']}个文件 | {item.get('started_at', '')[:19] if item.get('started_at') else '-'}",
+            expanded=False
+        ):
+            col1, col2, col3 = st.columns([2, 1, 1])
+            with col1:
+                st.write(f"**批次ID**: `{item['batch_id']}`")
+                st.write(f"**批次名称**: {item['batch_name']}")
+                st.write(f"**状态**: {status_cn}")
+                st.write(f"**文件数**: {item['file_count']}")
+                st.write(f"**成功/失败**: {item['success_count']} / {item['failed_count']}")
+                st.write(f"**提交时间**: {item.get('started_at', '-')[:19] if item.get('started_at') else '-'}")
+            with col2:
+                if st.button("📂 加载报告", key=f"load_{item['batch_id']}", use_container_width=True):
+                    st.session_state["batch_id"] = item["batch_id"]
+                    st.session_state["batch_status"] = None
+                    st.session_state["batch_report"] = None
+                    st.rerun()
+            with col3:
+                if item["status"] == "completed":
+                    if "compare_batch_a" not in st.session_state:
+                        st.session_state["compare_batch_a"] = None
+                    if "compare_batch_b" not in st.session_state:
+                        st.session_state["compare_batch_b"] = None
+
+                    is_a = st.session_state.get("compare_batch_a") == item["batch_id"]
+                    is_b = st.session_state.get("compare_batch_b") == item["batch_id"]
+
+                    if st.button(
+                        "📍 选为A" if not is_a else "✓ 已选A",
+                        key=f"sel_a_{item['batch_id']}",
+                        use_container_width=True,
+                        type="primary" if is_a else "secondary"
+                    ):
+                        st.session_state["compare_batch_a"] = item["batch_id"] if not is_a else None
+                        st.rerun()
+
+                    if st.button(
+                        "📍 选为B" if not is_b else "✓ 已选B",
+                        key=f"sel_b_{item['batch_id']}",
+                        use_container_width=True,
+                        type="primary" if is_b else "secondary"
+                    ):
+                        st.session_state["compare_batch_b"] = item["batch_id"] if not is_b else None
+                        st.rerun()
+
+    ca = st.session_state.get("compare_batch_a")
+    cb = st.session_state.get("compare_batch_b")
+    if ca and cb:
+        st.markdown("---")
+        col_info, col_btn = st.columns([3, 1])
+        with col_info:
+            st.info(f"已选择对比: 批次A vs 批次B")
+        with col_btn:
+            if st.button("🔍 跨批次对比", type="primary", use_container_width=True, key="do_compare"):
+                st.session_state["show_compare"] = True
+                st.rerun()
+    elif ca or cb:
+        st.caption("已选择1个批次，请再选1个进行对比")
+
+
+def plot_cross_batch_comparison(compare_result):
+    batch_a_name = compare_result["batch_a"]["batch_name"]
+    batch_b_name = compare_result["batch_b"]["batch_name"]
+
+    comparisons = compare_result.get("comparisons", [])
+    if not comparisons:
+        st.info("无可对比的指标")
+        return
+
+    metric_labels = {
+        "emotion_distribution.neutral": "情感分布-中性",
+        "emotion_distribution.happy": "情感分布-高兴",
+        "emotion_distribution.sad": "情感分布-悲伤",
+        "emotion_distribution.angry": "情感分布-愤怒",
+        "emotion_distribution.fear": "情感分布-恐惧",
+        "emotion_distribution.surprise": "情感分布-惊讶",
+        "emotion_distribution.disgust": "情感分布-厌恶",
+        "valence_trend.mean_slope": "效价趋势-平均斜率",
+        "valence_trend.std_slope": "效价趋势-斜率标准差",
+        "valence_trend.mean_valence": "效价趋势-平均效价",
+        "arousal_pattern.mean_arousal_std": "唤醒度模式-平均标准差",
+        "arousal_pattern.mean_arousal": "唤醒度模式-平均唤醒度",
+        "arousal_pattern.avg_escalation_count": "唤醒度模式-平均激化次数",
+        "arousal_pattern.avg_sharp_change_count": "唤醒度模式-平均突变次数",
+        "speaker_similarity.mean_sync_score": "说话人同步-平均同步分",
+        "speaker_similarity.std_sync_score": "说话人同步-同步分标准差"
+    }
+
+    dim_groups = {}
+    for comp in comparisons:
+        metric = comp["metric"]
+        dim = metric.split(".")[0]
+        if dim not in dim_groups:
+            dim_groups[dim] = []
+        dim_groups[dim].append(comp)
+
+    dim_names_cn = {
+        "emotion_distribution": "🎭 情感分布",
+        "valence_trend": "📈 效价趋势",
+        "arousal_pattern": "⚡ 唤醒度模式",
+        "speaker_similarity": "👥 说话人同步性"
+    }
+
+    for dim, dim_comps in dim_groups.items():
+        st.markdown("---")
+        st.subheader(dim_names_cn.get(dim, dim))
+
+        labels = []
+        values_a = []
+        values_b = []
+        colors_a = []
+        colors_b = []
+
+        for comp in dim_comps:
+            label = metric_labels.get(comp["metric"], comp["metric"])
+            labels.append(label)
+            values_a.append(comp["batch_a_value"])
+            values_b.append(comp["batch_b_value"])
+
+            if comp["is_significant"]:
+                colors_a.append("#FF6B6B")
+                colors_b.append("#FF6B6B")
+            else:
+                colors_a.append("#4C9FDB")
+                colors_b.append("#6BCB77")
+
+        fig = go.Figure()
+        fig.add_trace(go.Bar(
+            name=batch_a_name,
+            x=labels,
+            y=values_a,
+            marker_color=colors_a,
+            text=[f"{v:.4f}" for v in values_a],
+            textposition='outside'
+        ))
+        fig.add_trace(go.Bar(
+            name=batch_b_name,
+            x=labels,
+            y=values_b,
+            marker_color=colors_b,
+            text=[f"{v:.4f}" for v in values_b],
+            textposition='outside'
+        ))
+
+        fig.update_layout(
+            barmode='group',
+            title=f"{dim_names_cn.get(dim, dim)}对比",
+            xaxis_title="指标",
+            yaxis_title="数值",
+            height=400,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        significant = [c for c in dim_comps if c["is_significant"]]
+        if significant:
+            st.warning(f"⚠️ 显著差异指标 (阈值={compare_result.get('threshold', 0.15)}):")
+            for comp in significant:
+                label = metric_labels.get(comp["metric"], comp["metric"])
+                direction = "更高" if comp["difference"] > 0 else "更低"
+                st.markdown(
+                    f"- **{label}**: {batch_a_name} ({comp['batch_a_value']:.4f}) vs "
+                    f"{batch_b_name} ({comp['batch_b_value']:.4f}), "
+                    f"差值={comp['difference']:.4f} (B相对A{direction})"
+                )
+
+
+def render_compare_section():
+    if not st.session_state.get("show_compare", False):
+        return
+
+    ca = st.session_state.get("compare_batch_a")
+    cb = st.session_state.get("compare_batch_b")
+    if not ca or not cb:
+        return
+
+    st.markdown("---")
+    st.header("🔍 跨批次对比报告")
+
+    col_close, _ = st.columns([1, 5])
+    with col_close:
+        if st.button("❌ 关闭对比", use_container_width=True):
+            st.session_state["show_compare"] = False
+            st.rerun()
+
+    with st.spinner("正在生成跨批次对比报告..."):
+        compare_result = call_batch_compare_api(ca, cb)
+
+    if not compare_result or "error" in compare_result:
+        st.error(f"对比失败: {compare_result.get('error', '未知错误') if compare_result else '未知错误'}")
+        return
+
+    batch_a = compare_result["batch_a"]
+    batch_b = compare_result["batch_b"]
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("批次A", batch_a["batch_name"])
+        st.caption(f"文件数: {batch_a['file_count']}")
+    with col2:
+        st.metric("批次B", batch_b["batch_name"])
+        st.caption(f"文件数: {batch_b['file_count']}")
+    with col3:
+        st.metric("显著差异指标数", compare_result.get("significant_diff_count", 0))
+        st.caption(f"阈值: {compare_result.get('threshold', 0.15)}")
+
+    plot_cross_batch_comparison(compare_result)
+
+    with st.expander("📄 查看完整对比数据", expanded=False):
+        st.json(compare_result)
+
+
 def render_batch_page():
     st.header("📊 批量对比分析")
 
@@ -922,67 +1208,75 @@ def render_batch_page():
     else:
         st.sidebar.error("API服务未连接")
 
-    st.subheader("1. 上传音频文件")
-    uploaded_files = st.file_uploader(
-        "选择多个音频文件 (2-20个, 支持WAV/MP3/FLAC/OGG/M4A)",
-        type=["wav", "mp3", "flac", "ogg", "m4a"],
-        accept_multiple_files=True
-    )
+    render_history_section()
+    render_compare_section()
 
-    if uploaded_files:
-        st.info(f"已选择 {len(uploaded_files)} 个文件")
-        for f in uploaded_files:
-            st.caption(f"📄 {f.name} ({f.size/1024/1024:.2f} MB)")
+    st.markdown("---")
+    st.subheader("📤 提交新批次")
 
-    st.subheader("2. 对比配置")
-
-    batch_name = st.text_input("批次名称", value=f"批次_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
-
-    dimension_options = [
-        ("emotion_distribution", "情感分布对比"),
-        ("valence_trend", "效价趋势对比"),
-        ("arousal_pattern", "唤醒度模式对比"),
-        ("speaker_similarity", "说话人同步性对比")
-    ]
-
-    selected_dims = st.multiselect(
-        "选择对比维度 (至少选择1个)",
-        [d[0] for d in dimension_options],
-        format_func=lambda x: dict(dimension_options)[x],
-        default=[d[0] for d in dimension_options]
-    )
-
-    baseline_file = None
-    if uploaded_files:
-        baseline_file = st.selectbox(
-            "选择基线文件 (可选，其他文件将与此文件对比)",
-            ["无"] + [f.name for f in uploaded_files]
+    with st.expander("展开上传和配置面板", expanded=True):
+        st.subheader("1. 上传音频文件")
+        uploaded_files = st.file_uploader(
+            "选择多个音频文件 (2-20个, 支持WAV/MP3/FLAC/OGG/M4A)",
+            type=["wav", "mp3", "flac", "ogg", "m4a"],
+            accept_multiple_files=True
         )
-        if baseline_file == "无":
-            baseline_file = None
 
-    st.subheader("3. 提交任务")
+        if uploaded_files:
+            st.info(f"已选择 {len(uploaded_files)} 个文件")
+            for f in uploaded_files:
+                st.caption(f"📄 {f.name} ({f.size/1024/1024:.2f} MB)")
 
-    if st.button("🚀 提交批量分析任务", type="primary", disabled=not (uploaded_files and selected_dims)):
-        if not uploaded_files or len(uploaded_files) < 2:
-            st.error("请至少上传2个音频文件")
-        elif not selected_dims:
-            st.error("请至少选择1个对比维度")
-        elif len(uploaded_files) > 20:
-            st.error("最多只能上传20个音频文件")
-        else:
-            batch_config = {
-                "batch_name": batch_name,
-                "dimensions": selected_dims,
-                "baseline_file": baseline_file
-            }
-            with st.spinner("正在提交批量任务..."):
-                result = call_batch_submit_api(uploaded_files, batch_config)
-                if result:
-                    st.session_state["batch_id"] = result["batch_id"]
-                    st.session_state["batch_status"] = None
-                    st.session_state["batch_report"] = None
-                    st.success(f"✅ 批量任务提交成功! Batch ID: {result['batch_id']}")
+        st.subheader("2. 对比配置")
+
+        batch_name = st.text_input("批次名称", value=f"批次_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+
+        dimension_options = [
+            ("emotion_distribution", "情感分布对比"),
+            ("valence_trend", "效价趋势对比"),
+            ("arousal_pattern", "唤醒度模式对比"),
+            ("speaker_similarity", "说话人同步性对比")
+        ]
+
+        selected_dims = st.multiselect(
+            "选择对比维度 (至少选择1个)",
+            [d[0] for d in dimension_options],
+            format_func=lambda x: dict(dimension_options)[x],
+            default=[d[0] for d in dimension_options]
+        )
+
+        baseline_file = None
+        if uploaded_files:
+            baseline_file = st.selectbox(
+                "选择基线文件 (可选，其他文件将与此文件对比)",
+                ["无"] + [f.name for f in uploaded_files]
+            )
+            if baseline_file == "无":
+                baseline_file = None
+
+        st.subheader("3. 提交任务")
+
+        if st.button("🚀 提交批量分析任务", type="primary", disabled=not (uploaded_files and selected_dims)):
+            if not uploaded_files or len(uploaded_files) < 2:
+                st.error("请至少上传2个音频文件")
+            elif not selected_dims:
+                st.error("请至少选择1个对比维度")
+            elif len(uploaded_files) > 20:
+                st.error("最多只能上传20个音频文件")
+            else:
+                batch_config = {
+                    "batch_name": batch_name,
+                    "dimensions": selected_dims,
+                    "baseline_file": baseline_file
+                }
+                with st.spinner("正在提交批量任务..."):
+                    result = call_batch_submit_api(uploaded_files, batch_config)
+                    if result:
+                        st.session_state["batch_id"] = result["batch_id"]
+                        st.session_state["batch_status"] = None
+                        st.session_state["batch_report"] = None
+                        st.success(f"✅ 批量任务提交成功! Batch ID: {result['batch_id']}")
+                        st.rerun()
 
     if "batch_id" in st.session_state:
         st.markdown("---")

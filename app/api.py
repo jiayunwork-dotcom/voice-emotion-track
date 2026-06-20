@@ -27,7 +27,8 @@ from app.dialogue_tracker import (
 from app.batch_processor import (
     create_batch_task, get_batch, get_batch_status,
     BatchConfig, validate_file_extension, generate_csv_report,
-    FileStatus, BatchStatus
+    FileStatus, BatchStatus, list_batches, init_batch_history,
+    compare_batches
 )
 
 logger = logging.getLogger(__name__)
@@ -636,3 +637,94 @@ async def get_batch_report(
             content=json.dumps(clean_report, ensure_ascii=False, indent=2),
             media_type="application/json"
         )
+
+
+class BatchListItemResponse(BaseModel):
+    batch_id: str
+    batch_name: str
+    file_count: int
+    status: str
+    started_at: Optional[str] = None
+    completed_at: Optional[str] = None
+    success_count: int
+    failed_count: int
+
+
+class BatchListResponse(BaseModel):
+    items: List[BatchListItemResponse]
+    total: int
+    page: int
+    page_size: int
+    total_pages: int
+
+
+@app.get("/api/batch/list", response_model=BatchListResponse)
+async def get_batch_list(
+    status: Optional[str] = Query(None, pattern="^(completed|failed|processing|queued)$"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100)
+):
+    result = list_batches(status=status, page=page, page_size=page_size)
+    items = [BatchListItemResponse(**item) for item in result["items"]]
+    return BatchListResponse(
+        items=items,
+        total=result["total"],
+        page=result["page"],
+        page_size=result["page_size"],
+        total_pages=result["total_pages"]
+    )
+
+
+@app.on_event("startup")
+async def startup_event():
+    init_batch_history()
+
+
+class BatchCompareRequest(BaseModel):
+    batch_id_a: str
+    batch_id_b: str
+
+
+class BatchCompareMetric(BaseModel):
+    metric: str
+    batch_a_value: float
+    batch_b_value: float
+    difference: float
+    abs_difference: float
+    is_significant: bool
+
+
+class BatchCompareBatchInfo(BaseModel):
+    batch_id: str
+    batch_name: str
+    file_count: int
+    completed_at: Optional[str] = None
+    metrics: dict
+
+
+class BatchCompareResponse(BaseModel):
+    batch_a: BatchCompareBatchInfo
+    batch_b: BatchCompareBatchInfo
+    comparisons: List[BatchCompareMetric]
+    significant_diffs: List[str]
+    significant_diff_count: int
+    threshold: float
+
+
+@app.post("/api/batch/compare", response_model=BatchCompareResponse)
+async def compare_batches_api(request: BatchCompareRequest):
+    if request.batch_id_a == request.batch_id_b:
+        raise HTTPException(status_code=400, detail="Cannot compare a batch with itself")
+
+    result = compare_batches(request.batch_id_a, request.batch_id_b)
+    if result is None:
+        raise HTTPException(status_code=404, detail="One or both batches not found or not completed")
+
+    return BatchCompareResponse(
+        batch_a=BatchCompareBatchInfo(**result["batch_a"]),
+        batch_b=BatchCompareBatchInfo(**result["batch_b"]),
+        comparisons=[BatchCompareMetric(**c) for c in result["comparisons"]],
+        significant_diffs=result["significant_diffs"],
+        significant_diff_count=result["significant_diff_count"],
+        threshold=result["threshold"]
+    )
