@@ -34,7 +34,7 @@ from app.stream_processor import (
     register_session, unregister_session, get_session, list_active_sessions,
     get_session_results, get_all_session_results, update_session_activity,
     set_session_config, increment_frame_count, append_frame_result,
-    analyze_frame_with_timeout, compute_summary, persist_summary,
+    analyze_frame_with_timeout, compute_summary, persist_summary, cleanup_overflow,
     _pcm_bytes_to_float32, increment_timeout_count,
     VALID_MODEL_MODES, CONFIG_TIMEOUT_SEC
 )
@@ -946,6 +946,7 @@ async def websocket_stream(websocket: WebSocket,
             except Exception:
                 pass
             persist_summary(session_id, summary, all_results)
+            cleanup_overflow(sess)
         await unregister_session(session_id)
         try:
             await websocket.close()

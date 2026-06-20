@@ -10,6 +10,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
+import tempfile
+
 from app.config import get_config
 from app.feature_extractor import extract_features, features_to_vector
 from app.emotion_classifier import get_classifier, EmotionResult, EMOTION_LABELS
@@ -18,7 +20,9 @@ logger = logging.getLogger(__name__)
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SESSIONS_DIR = os.path.join(BASE_DIR, "data", "stream_sessions")
+OVERFLOW_DIR = os.path.join(BASE_DIR, "data", "_overflow_tmp")
 os.makedirs(SESSIONS_DIR, exist_ok=True)
+os.makedirs(OVERFLOW_DIR, exist_ok=True)
 
 VALID_MODEL_MODES = {"svm", "rf", "wav2vec2"}
 MAX_ACTIVE_SESSIONS = 10
@@ -51,13 +55,15 @@ class StreamSession:
     started_at: float = field(default_factory=time.time)
     last_active_at: float = field(default_factory=time.time)
     results_buffer: deque = field(default_factory=lambda: deque(maxlen=RING_BUFFER_SIZE))
-    all_results: List[FrameResult] = field(default_factory=list)
     config_received: bool = False
     closed: bool = False
     alert_threshold: int = 3
     alert_count: int = 0
     recent_emotions: List[str] = field(default_factory=list)
     emotion_counter: Counter = field(default_factory=Counter)
+    total_valence: float = 0.0
+    total_arousal: float = 0.0
+    _overflow_file_path: Optional[str] = None
 
 
 _sessions: Dict[str, StreamSession] = {}
@@ -166,7 +172,13 @@ async def unregister_session(session_id: str):
         if session_id in _sessions:
             _sessions[session_id].closed = True
             _sessions[session_id].status = "disconnected"
+            overflow_path = _sessions[session_id]._overflow_file_path
             del _sessions[session_id]
+    if overflow_path and os.path.exists(overflow_path):
+        try:
+            os.unlink(overflow_path)
+        except Exception:
+            pass
 
 
 async def get_session(session_id: str) -> Optional[StreamSession]:
@@ -235,14 +247,61 @@ async def append_frame_result(session_id: str, result: FrameResult) -> Optional[
         if session_id not in _sessions:
             return None
         sess = _sessions[session_id]
+        if len(sess.results_buffer) == RING_BUFFER_SIZE:
+            evicted = sess.results_buffer[0]
+            _write_overflow(sess, evicted)
         sess.results_buffer.append(result)
-        sess.all_results.append(result)
         sess.analyzed_frames += 1
         sess.emotion_counter[result.emotion] += 1
+        sess.total_valence += result.valence
+        sess.total_arousal += result.arousal
         alert = _check_emotion_shift(sess, result)
-        if alert is not None:
-            sess.alert_count += 1
         return alert
+
+
+def _write_overflow(session: StreamSession, frame: FrameResult):
+    if session._overflow_file_path is None:
+        fd, path = tempfile.mkstemp(suffix=".jsonl", prefix=f"ovf_{session.session_id}_",
+                                     dir=OVERFLOW_DIR)
+        os.close(fd)
+        session._overflow_file_path = path
+    line = json.dumps({
+        "seq": frame.seq,
+        "emotion": frame.emotion,
+        "confidence": frame.confidence,
+        "valence": frame.valence,
+        "arousal": frame.arousal,
+        "timestamp_ms": frame.timestamp_ms
+    }, ensure_ascii=False)
+    try:
+        with open(session._overflow_file_path, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception as e:
+        logger.error(f"Failed to write overflow for session {session.session_id}: {e}")
+
+
+def _read_overflow(session: StreamSession) -> List[FrameResult]:
+    if session._overflow_file_path is None or not os.path.exists(session._overflow_file_path):
+        return []
+    results = []
+    try:
+        with open(session._overflow_file_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                d = json.loads(line)
+                results.append(FrameResult(
+                    seq=d["seq"],
+                    emotion=d["emotion"],
+                    confidence=d["confidence"],
+                    valence=d["valence"],
+                    arousal=d["arousal"],
+                    timestamp_ms=d["timestamp_ms"]
+                ))
+    except Exception as e:
+        logger.error(f"Failed to read overflow for session {session.session_id}: {e}")
+    return results
 
 
 def _check_emotion_shift(session: StreamSession, result: FrameResult) -> Optional[dict]:
@@ -270,6 +329,7 @@ def _check_emotion_shift(session: StreamSession, result: FrameResult) -> Optiona
     if shift_emotion == dominant:
         return None
 
+    session.alert_count += 1
     return {
         "from_emotion": dominant,
         "to_emotion": shift_emotion,
@@ -285,7 +345,10 @@ async def increment_timeout_count(session_id: str):
 
 
 def compute_summary(session: StreamSession) -> dict:
-    if not session.all_results:
+    n = session.analyzed_frames
+    duration = session.frame_count * (session.chunk_duration_ms or 0) / 1000.0
+
+    if n == 0:
         return {
             "dominant_emotion": "neutral",
             "valence_mean": 0.0,
@@ -293,23 +356,16 @@ def compute_summary(session: StreamSession) -> dict:
             "total_frames": session.frame_count,
             "analyzed_frames": session.analyzed_frames,
             "timeout_frames": session.timeout_frames,
-            "duration_seconds": round(session.frame_count * (session.chunk_duration_ms or 0) / 1000.0, 2),
+            "duration_seconds": round(duration, 2),
             "alert_count": session.alert_count
         }
 
-    emotions = [r.emotion for r in session.all_results]
-    counter = Counter(emotions)
-    dominant = counter.most_common(1)[0][0]
-
-    valences = [r.valence for r in session.all_results]
-    arousals = [r.arousal for r in session.all_results]
-
-    duration = session.frame_count * (session.chunk_duration_ms or 0) / 1000.0
+    dominant = session.emotion_counter.most_common(1)[0][0]
 
     return {
         "dominant_emotion": dominant,
-        "valence_mean": round(float(np.mean(valences)), 4),
-        "arousal_mean": round(float(np.mean(arousals)), 4),
+        "valence_mean": round(session.total_valence / n, 4),
+        "arousal_mean": round(session.total_arousal / n, 4),
         "total_frames": session.frame_count,
         "analyzed_frames": session.analyzed_frames,
         "timeout_frames": session.timeout_frames,
@@ -321,9 +377,10 @@ def compute_summary(session: StreamSession) -> dict:
 async def get_all_session_results(session_id: str) -> Optional[List[FrameResult]]:
     async with _sessions_lock:
         sess = _sessions.get(session_id)
-        if sess:
-            return list(sess.all_results)
-        return None
+        if sess is None:
+            return None
+        overflow = _read_overflow(sess)
+        return overflow + list(sess.results_buffer)
 
 
 def persist_summary(session_id: str, summary: dict, results: List[FrameResult]):
@@ -350,3 +407,11 @@ def persist_summary(session_id: str, summary: dict, results: List[FrameResult]):
         logger.info(f"Session summary persisted: {file_path}")
     except Exception as e:
         logger.error(f"Failed to persist session {session_id}: {e}")
+
+
+def cleanup_overflow(session: StreamSession):
+    if session._overflow_file_path and os.path.exists(session._overflow_file_path):
+        try:
+            os.unlink(session._overflow_file_path)
+        except Exception:
+            pass
