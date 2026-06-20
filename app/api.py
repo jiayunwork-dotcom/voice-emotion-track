@@ -4,11 +4,15 @@ import asyncio
 import logging
 import os
 import tempfile
+import json
+import csv
+import io
 from datetime import datetime
 from typing import Dict, List, Optional
 
 from fastapi import FastAPI, File, UploadFile, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from pydantic import BaseModel
 
 from app.config import get_config, get_metrics_config
@@ -33,6 +37,7 @@ app.add_middleware(
 )
 
 _results_store: Dict[str, dict] = {}
+_result_metadata: Dict[str, dict] = {}
 
 config = get_config()
 MAX_FILE_SIZE = config["max_file_size_mb"] * 1024 * 1024
@@ -279,7 +284,12 @@ async def analyze_audio(
             incomplete_reason=result["incomplete_reason"]
         )
 
-        _results_store[task_id] = response.dict()
+        result_dict = response.dict()
+        _results_store[task_id] = result_dict
+        _result_metadata[task_id] = {
+            "filename": file.filename or "audio.wav",
+            "analyzed_at": datetime.now().isoformat()
+        }
         return response
 
     finally:
@@ -292,6 +302,115 @@ async def get_result(task_id: str):
     if result is None:
         return QueryResponse(task_id=task_id, error="Result not found")
     return QueryResponse(task_id=task_id, result=AnalyzeResponse(**result))
+
+
+def _build_annotation_data(task_id: str, result: dict, metadata: dict) -> dict:
+    audio_info = result.get("audio_info", {})
+    sentences = result.get("sentences", [])
+    summary = result.get("dialogue_summary", {})
+
+    turning_points = summary.get("turning_points", [])
+    escalation_intervals = summary.get("escalation_intervals", [])
+
+    tp_times = {tp["time"] for tp in turning_points}
+
+    sentence_annotations = []
+    for idx, sent in enumerate(sentences):
+        is_turning_point = sent["start_time"] in tp_times or any(
+            abs(sent["start_time"] - tp["time"]) < 0.01 for tp in turning_points
+        )
+
+        is_escalation = any(
+            esc["start_time"] <= sent["start_time"] <= esc["end_time"]
+            for esc in escalation_intervals
+        )
+
+        sentence_annotations.append({
+            "sentence_id": idx + 1,
+            "start_time": sent["start_time"],
+            "end_time": sent["end_time"],
+            "speaker_id": sent["speaker_id"],
+            "emotion": sent["emotion"],
+            "confidence": sent["confidence"],
+            "valence": sent["valence"],
+            "arousal": sent["arousal"],
+            "is_turning_point": is_turning_point,
+            "is_escalation": is_escalation
+        })
+
+    dialogue_summary = {
+        "dominant_emotion": summary.get("dominant_emotion", "neutral"),
+        "valence_std": summary.get("valence_std", 0.0),
+        "conflict_density": summary.get("conflict_density", 0.0),
+        "turning_point_count": len(turning_points),
+        "escalation_interval_count": len(escalation_intervals),
+        "contagion_event_count": len(summary.get("contagion_events", []))
+    }
+
+    annotation = {
+        "audio_metadata": {
+            "filename": metadata.get("filename", "unknown.wav"),
+            "duration": audio_info.get("duration", 0.0),
+            "sample_rate": audio_info.get("sample_rate", 0),
+            "channels": audio_info.get("channels", 0),
+            "analyzed_at": metadata.get("analyzed_at", "")
+        },
+        "sentences": sentence_annotations,
+        "dialogue_summary": dialogue_summary
+    }
+    return annotation
+
+
+def _generate_json_annotation(annotation: dict) -> str:
+    return json.dumps(annotation, ensure_ascii=False, indent=2)
+
+
+def _generate_csv_annotation(annotation: dict) -> str:
+    sentences = annotation.get("sentences", [])
+    if not sentences:
+        return ""
+
+    output = io.StringIO()
+    fieldnames = [
+        "sentence_id", "start_time", "end_time", "speaker_id",
+        "emotion", "confidence", "valence", "arousal",
+        "is_turning_point", "is_escalation"
+    ]
+    writer = csv.DictWriter(output, fieldnames=fieldnames)
+    writer.writeheader()
+    for sent in sentences:
+        writer.writerow(sent)
+
+    return output.getvalue()
+
+
+@app.get("/api/export/{task_id}")
+async def export_annotation(
+    task_id: str,
+    format: str = Query("json", pattern="^(json|csv)$")
+):
+    result = _results_store.get(task_id)
+    metadata = _result_metadata.get(task_id, {})
+    if result is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    annotation = _build_annotation_data(task_id, result, metadata)
+
+    if format == "json":
+        content = _generate_json_annotation(annotation)
+        media_type = "application/json"
+        filename = f"annotation_{task_id}.json"
+    else:
+        content = _generate_csv_annotation(annotation)
+        media_type = "text/csv"
+        filename = f"annotation_{task_id}.csv"
+
+    response = Response(
+        content=content,
+        media_type=media_type
+    )
+    response.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+    return response
 
 
 @app.get("/api/health", response_model=HealthResponse)

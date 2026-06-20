@@ -93,6 +93,82 @@ def _audio_segment_to_wav_bytes(audio_segment, sr):
     return buf.read()
 
 
+def _build_annotation_data(result, filename):
+    audio_info = result.get("audio_info", {})
+    sentences = result.get("sentences", [])
+    summary = result.get("dialogue_summary", {})
+
+    turning_points = summary.get("turning_points", [])
+    escalation_intervals = summary.get("escalation_intervals", [])
+
+    sentence_annotations = []
+    for idx, sent in enumerate(sentences):
+        is_turning_point = any(
+            abs(sent["start_time"] - tp["time"]) < 0.01 for tp in turning_points
+        )
+
+        is_escalation = any(
+            esc["start_time"] <= sent["start_time"] <= esc["end_time"]
+            for esc in escalation_intervals
+        )
+
+        sentence_annotations.append({
+            "sentence_id": idx + 1,
+            "start_time": sent["start_time"],
+            "end_time": sent["end_time"],
+            "speaker_id": sent["speaker_id"],
+            "emotion": sent["emotion"],
+            "confidence": sent["confidence"],
+            "valence": sent["valence"],
+            "arousal": sent["arousal"],
+            "is_turning_point": is_turning_point,
+            "is_escalation": is_escalation
+        })
+
+    dialogue_summary = {
+        "dominant_emotion": summary.get("dominant_emotion", "neutral"),
+        "valence_std": summary.get("valence_std", 0.0),
+        "conflict_density": summary.get("conflict_density", 0.0),
+        "turning_point_count": len(turning_points),
+        "escalation_interval_count": len(escalation_intervals),
+        "contagion_event_count": len(summary.get("contagion_events", []))
+    }
+
+    from datetime import datetime
+    annotation = {
+        "audio_metadata": {
+            "filename": filename or "unknown.wav",
+            "duration": audio_info.get("duration", 0.0),
+            "sample_rate": audio_info.get("sample_rate", 0),
+            "channels": audio_info.get("channels", 0),
+            "analyzed_at": datetime.now().isoformat()
+        },
+        "sentences": sentence_annotations,
+        "dialogue_summary": dialogue_summary
+    }
+    return annotation
+
+
+def _generate_csv_annotation(annotation):
+    sentences = annotation.get("sentences", [])
+    if not sentences:
+        return ""
+
+    import csv
+    output = io.StringIO()
+    fieldnames = [
+        "sentence_id", "start_time", "end_time", "speaker_id",
+        "emotion", "confidence", "valence", "arousal",
+        "is_turning_point", "is_escalation"
+    ]
+    writer = csv.DictWriter(output, fieldnames=fieldnames)
+    writer.writeheader()
+    for sent in sentences:
+        writer.writerow(sent)
+
+    return output.getvalue()
+
+
 def plot_waveform_with_emotions(result, audio_data=None, sr=None):
     sentences = result.get("sentences", [])
     if not sentences:
@@ -157,7 +233,7 @@ def plot_waveform_with_emotions(result, audio_data=None, sr=None):
     st.plotly_chart(fig, use_container_width=True)
 
 
-def plot_emotion_trajectory(result):
+def plot_emotion_trajectory(result, highlight_idx=None):
     sentences = result.get("sentences", [])
     summary = result.get("dialogue_summary", {})
     if not sentences:
@@ -170,17 +246,30 @@ def plot_emotion_trajectory(result):
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
                         subplot_titles=("效价 (Valence) 轨迹", "唤醒度 (Arousal) 轨迹"))
 
+    marker_sizes_valence = [8] * len(sentences)
+    marker_sizes_arousal = [8] * len(sentences)
+    marker_colors_valence = ["blue"] * len(sentences)
+    marker_colors_arousal = ["red"] * len(sentences)
+
+    if highlight_idx is not None and 0 <= highlight_idx < len(sentences):
+        marker_sizes_valence[highlight_idx] = 18
+        marker_sizes_arousal[highlight_idx] = 18
+        marker_colors_valence[highlight_idx] = "gold"
+        marker_colors_arousal[highlight_idx] = "gold"
+
     fig.add_trace(go.Scatter(
         x=times, y=valences, mode='lines+markers',
         line=dict(color='blue', width=2),
-        marker=dict(size=8),
+        marker=dict(size=marker_sizes_valence, color=marker_colors_valence,
+                    line=dict(color='darkblue', width=1)),
         name='效价'
     ), row=1, col=1)
 
     fig.add_trace(go.Scatter(
         x=times, y=arousals, mode='lines+markers',
         line=dict(color='red', width=2),
-        marker=dict(size=8),
+        marker=dict(size=marker_sizes_arousal, color=marker_colors_arousal,
+                    line=dict(color='darkred', width=1)),
         name='唤醒度'
     ), row=2, col=1)
 
@@ -193,7 +282,7 @@ def plot_emotion_trajectory(result):
                       fillcolor="red", opacity=0.1,
                       annotation_text="激化", row=2, col=1)
 
-    fig.update_layout(height=500, title_text="情绪轨迹曲线")
+    fig.update_layout(height=500, title_text="情绪轨迹曲线", showlegend=False)
     fig.update_yaxes(range=[-1.1, 1.1], row=1, col=1)
     fig.update_yaxes(range=[-1.1, 1.1], row=2, col=1)
     fig.update_xaxes(title_text="时间 (秒)", row=2, col=1)
@@ -282,6 +371,218 @@ def render_sentence_table(result):
         })
     df = pd.DataFrame(df_data)
     st.dataframe(df, use_container_width=True)
+
+
+def render_export_buttons(result, filename):
+    annotation = _build_annotation_data(result, filename)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        json_str = json.dumps(annotation, ensure_ascii=False, indent=2)
+        st.download_button(
+            label="📥 导出 JSON 标注",
+            data=json_str,
+            file_name=f"annotation_{result.get('task_id', 'result')}.json",
+            mime="application/json",
+            use_container_width=True
+        )
+    with col2:
+        csv_str = _generate_csv_annotation(annotation)
+        st.download_button(
+            label="📊 导出 CSV 标注",
+            data=csv_str,
+            file_name=f"annotation_{result.get('task_id', 'result')}.csv",
+            mime="text/csv",
+            use_container_width=True
+        )
+
+
+def render_dialogue_playback(result, audio_raw, audio_sr, is_dual):
+    import time
+
+    sentences = result.get("sentences", [])
+    if not sentences or audio_raw is None or audio_sr is None:
+        st.info("音频数据不可用，无法回放")
+        return
+
+    num_sentences = len(sentences)
+
+    if "playback_current" not in st.session_state:
+        st.session_state["playback_current"] = 0
+    if "playback_playing" not in st.session_state:
+        st.session_state["playback_playing"] = False
+    if "playback_auto_advance" not in st.session_state:
+        st.session_state["playback_auto_advance"] = False
+
+    st.subheader("🎬 对话回放")
+
+    progress_value = (st.session_state["playback_current"] + 1) / num_sentences if num_sentences > 0 else 0
+    st.progress(progress_value)
+    st.caption(f"播放进度: {st.session_state['playback_current'] + 1}/{num_sentences}")
+
+    col1, col2, col3, col4 = st.columns([1, 1, 1, 2])
+    with col1:
+        if st.button("▶️ 播放", use_container_width=True, key="play_btn"):
+            st.session_state["playback_playing"] = True
+            st.session_state["playback_auto_advance"] = True
+            if st.session_state["playback_current"] >= num_sentences:
+                st.session_state["playback_current"] = 0
+    with col2:
+        if st.button("⏸️ 暂停", use_container_width=True, key="pause_btn"):
+            st.session_state["playback_playing"] = False
+            st.session_state["playback_auto_advance"] = False
+    with col3:
+        if st.button("⏮️ 重置", use_container_width=True, key="reset_btn"):
+            st.session_state["playback_playing"] = False
+            st.session_state["playback_auto_advance"] = False
+            st.session_state["playback_current"] = 0
+    with col4:
+        jump_idx = st.number_input(
+            "跳转到句子",
+            min_value=1,
+            max_value=num_sentences,
+            value=st.session_state["playback_current"] + 1,
+            step=1,
+            key="jump_input"
+        )
+        if st.button("跳转", use_container_width=True, key="jump_btn"):
+            st.session_state["playback_current"] = jump_idx - 1
+            st.session_state["playback_playing"] = False
+            st.session_state["playback_auto_advance"] = False
+
+    current_idx = st.session_state["playback_current"]
+    if 0 <= current_idx < num_sentences:
+        current_sent = sentences[current_idx]
+        emotion = current_sent["emotion"]
+        color = EMOTION_COLORS.get(emotion, "#808080")
+        speaker_id = current_sent["speaker_id"]
+
+        speaker_bg = "#E8F4FD" if speaker_id == "speaker_0" else "#F0FFF0"
+        if not is_dual:
+            speaker_bg = "#F5F5F5"
+
+        st.markdown(
+            f'<div style="padding: 15px; border-radius: 10px; background-color: {speaker_bg}; '
+            f'border-left: 5px solid {color}; margin: 10px 0;">'
+            f'<strong>句{current_idx + 1}</strong> | {speaker_id} | '
+            f'{current_sent["start_time"]:.1f}s - {current_sent["end_time"]:.1f}s<br>'
+            f'<span style="color: {color}; font-weight: bold;">'
+            f'{EMOTION_LABELS_CN.get(emotion, emotion)}</span> '
+            f'(置信度: {current_sent["confidence"]:.2f})<br>'
+            f'效价: {current_sent["valence"]:.2f} | 唤醒度: {current_sent["arousal"]:.2f}'
+            f'</div>',
+            unsafe_allow_html=True
+        )
+
+        start_sample = int(current_sent["start_time"] * audio_sr)
+        end_sample = int(current_sent["end_time"] * audio_sr)
+        end_sample = min(end_sample, len(audio_raw))
+        if start_sample < end_sample:
+            segment = audio_raw[start_sample:end_sample]
+            wav_bytes = _audio_segment_to_wav_bytes(segment, audio_sr)
+            st.audio(wav_bytes, format="audio/wav", autoplay=st.session_state["playback_playing"], key=f"audio_{current_idx}")
+
+        with st.expander("📈 当前情绪轨迹位置", expanded=True):
+            sentences = result.get("sentences", [])
+            summary = result.get("dialogue_summary", {})
+            times = [(s["start_time"] + s["end_time"]) / 2 for s in sentences]
+            valences = [s["valence"] for s in sentences]
+            arousals = [s["arousal"] for s in sentences]
+
+            marker_sizes_v = [6] * len(sentences)
+            marker_sizes_a = [6] * len(sentences)
+            marker_colors_v = ["blue"] * len(sentences)
+            marker_colors_a = ["red"] * len(sentences)
+
+            if 0 <= current_idx < len(sentences):
+                marker_sizes_v[current_idx] = 16
+                marker_sizes_a[current_idx] = 16
+                marker_colors_v[current_idx] = "gold"
+                marker_colors_a[current_idx] = "gold"
+
+            fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                                subplot_titles=("效价轨迹", "唤醒度轨迹"),
+                                vertical_spacing=0.08)
+
+            fig.add_trace(go.Scatter(
+                x=times, y=valences, mode='lines+markers',
+                line=dict(color='blue', width=2),
+                marker=dict(size=marker_sizes_v, color=marker_colors_v,
+                            line=dict(color='darkblue', width=1)),
+                name='效价'
+            ), row=1, col=1)
+
+            fig.add_trace(go.Scatter(
+                x=times, y=arousals, mode='lines+markers',
+                line=dict(color='red', width=2),
+                marker=dict(size=marker_sizes_a, color=marker_colors_a,
+                            line=dict(color='darkred', width=1)),
+                name='唤醒度'
+            ), row=2, col=1)
+
+            for tp in summary.get("turning_points", []):
+                fig.add_vline(x=tp["time"], line_dash="dash", line_color="orange",
+                              line_width=1, row=1, col=1)
+
+            for esc in summary.get("escalation_intervals", []):
+                fig.add_vrect(x0=esc["start_time"], x1=esc["end_time"],
+                              fillcolor="red", opacity=0.1,
+                              line_width=0, row=2, col=1)
+
+            fig.update_layout(height=280, showlegend=False, margin=dict(t=30, b=30))
+            fig.update_yaxes(range=[-1.1, 1.1], row=1, col=1)
+            fig.update_yaxes(range=[-1.1, 1.1], row=2, col=1)
+            fig.update_xaxes(title_text="时间 (秒)", row=2, col=1)
+            st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("---")
+    st.caption("句子列表（当前播放句高亮显示）")
+
+    sentence_list_container = st.container()
+    with sentence_list_container:
+        for i, sent in enumerate(sentences):
+            is_current = (i == current_idx)
+            sent_emotion = sent["emotion"]
+            sent_color = EMOTION_COLORS.get(sent_emotion, "#808080")
+            sent_speaker = sent["speaker_id"]
+
+            if is_current:
+                bg_color = "#FFFACD" if not is_dual else ("#E8F4FD" if sent_speaker == "speaker_0" else "#F0FFF0")
+                border_style = f"2px solid {sent_color}"
+            else:
+                bg_color = "#FAFAFA"
+                border_style = "1px solid #E0E0E0"
+
+            speaker_label = f"[{sent_speaker}] " if is_dual else ""
+            st.markdown(
+                f'<div style="padding: 8px; margin: 4px 0; border-radius: 5px; '
+                f'background-color: {bg_color}; border: {border_style};">'
+                f'<strong>句{i + 1}</strong> {speaker_label}'
+                f'<span style="color: {sent_color};">● {EMOTION_LABELS_CN.get(sent_emotion, sent_emotion)}</span> '
+                f'| {sent["start_time"]:.1f}s - {sent["end_time"]:.1f}s'
+                f'</div>',
+                unsafe_allow_html=True
+            )
+
+    if st.session_state["playback_auto_advance"] and st.session_state["playback_playing"]:
+        sent_duration = sentences[current_idx]["end_time"] - sentences[current_idx]["start_time"]
+        pause_duration = 0.5
+        total_wait = sent_duration + pause_duration
+
+        placeholder = st.empty()
+        placeholder.info(f"⏳ 播放中... 下一句将在 {pause_duration:.1f}秒 后播放")
+
+        time.sleep(min(total_wait, 10))
+        placeholder.empty()
+
+        if st.session_state["playback_current"] < num_sentences - 1:
+            st.session_state["playback_current"] += 1
+            st.rerun()
+        else:
+            st.session_state["playback_playing"] = False
+            st.session_state["playback_auto_advance"] = False
+            st.success("✅ 播放完成")
+            st.rerun()
 
 
 def render_summary(result):
@@ -393,7 +694,12 @@ def main():
         render_sentence_table(result)
 
         st.header("📝 对话情绪摘要")
-        render_summary(result)
+        col_summary, col_export = st.columns([3, 1])
+        with col_summary:
+            render_summary(result)
+        with col_export:
+            st.subheader("导出标注")
+            render_export_buttons(result, st.session_state.get("audio_filename", "audio.wav"))
 
         with st.expander("🔧 模型性能参考"):
             metrics = result.get("metrics", {})
@@ -420,6 +726,14 @@ def main():
                     st.warning("片段时间范围无效")
             else:
                 st.info(f"播放: {sel['start_time']:.1f}s - {sel['end_time']:.1f}s (原始音频未缓存，无法截取)")
+
+            with st.expander("🎬 对话回放", expanded=False):
+                render_dialogue_playback(
+                    result,
+                    audio_raw=st.session_state.get("audio_raw"),
+                    audio_sr=st.session_state.get("audio_sr"),
+                    is_dual=is_dual
+                )
 
 
 if __name__ == "__main__":
