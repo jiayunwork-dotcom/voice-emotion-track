@@ -1,0 +1,22 @@
+app_version: "1.0.0"
+max_file_size_mb: 50
+request_timeout_seconds: 60
+max_concurrent_requests: 5
+max_queue_size: 10
+vad_silence_threshold_sec: 0.5
+vad_min_segment_sec: 0.3
+wav2vec_sample_rate: 16000
+default_sample_rate: 22050
+emotion_labels:
+  - neutral
+  - happy
+  - sad
+  - angry
+  - fear
+  - surprise
+  - disgust
+valence_arousal_range: [-1.0, 1.0]
+turning_point_threshold: 0.4
+escalation_arousal_threshold: 0.6
+escalation_consecutive_count: 3
+contagion_window_sentences: 2

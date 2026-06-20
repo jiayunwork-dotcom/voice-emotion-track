@@ -1,0 +1,310 @@
+import uuid
+import time
+import asyncio
+import logging
+import os
+import tempfile
+from datetime import datetime
+from typing import Dict, List, Optional
+
+from fastapi import FastAPI, File, UploadFile, Query, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+from app.config import get_config, get_metrics_config
+from app.audio_processor import process_audio
+from app.feature_extractor import extract_features
+from app.emotion_classifier import get_classifier, EmotionResult
+from app.dialogue_tracker import (
+    SentenceEmotionResult, compute_dialogue_summary,
+    TurningPoint, EscalationInterval, ContagionEvent, DialogueSummary
+)
+
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title="Voice Emotion Track API", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+_results_store: Dict[str, dict] = {}
+_active_requests = 0
+_request_lock = asyncio.Lock()
+_queue_count = 0
+
+config = get_config()
+MAX_FILE_SIZE = config["max_file_size_mb"] * 1024 * 1024
+REQUEST_TIMEOUT = config["request_timeout_seconds"]
+MAX_CONCURRENT = config["max_concurrent_requests"]
+MAX_QUEUE = config["max_queue_size"]
+
+
+class TurningPointResponse(BaseModel):
+    time: float
+    valence_before: float
+    valence_after: float
+    delta: float
+
+
+class EscalationIntervalResponse(BaseModel):
+    start_time: float
+    end_time: float
+    avg_arousal: float
+
+
+class ContagionEventResponse(BaseModel):
+    source_speaker: str
+    target_speaker: str
+    source_time: float
+    target_time: float
+    delay_sentences: int
+    contagion_strength: float
+
+
+class SentenceResultResponse(BaseModel):
+    start_time: float
+    end_time: float
+    speaker_id: str
+    emotion: str
+    confidence: float
+    valence: float
+    arousal: float
+
+
+class DialogueSummaryResponse(BaseModel):
+    dominant_emotion: str
+    valence_std: float
+    conflict_density: float
+    turning_points: List[TurningPointResponse]
+    escalation_intervals: List[EscalationIntervalResponse]
+    contagion_events: List[ContagionEventResponse]
+
+
+class AudioInfoResponse(BaseModel):
+    duration: float
+    sample_rate: int
+    channels: int
+
+
+class MetricsResponse(BaseModel):
+    uar: float
+    f1_scores: Dict[str, float]
+    confusion_matrix: List[List[int]]
+
+
+class AnalyzeResponse(BaseModel):
+    task_id: str
+    audio_info: AudioInfoResponse
+    sentences: List[SentenceResultResponse]
+    dialogue_summary: DialogueSummaryResponse
+    metrics: MetricsResponse
+    model_mode: str
+    completed: bool
+    incomplete_reason: Optional[str] = None
+
+
+class HealthResponse(BaseModel):
+    status: str
+    version: str
+    models_loaded: Dict[str, bool]
+
+
+class QueryResponse(BaseModel):
+    task_id: str
+    result: Optional[AnalyzeResponse] = None
+    error: Optional[str] = None
+
+
+async def _check_concurrency():
+    global _active_requests, _queue_count
+    async with _request_lock:
+        if _active_requests >= MAX_CONCURRENT:
+            if _queue_count >= MAX_QUEUE:
+                raise HTTPException(status_code=503, detail="Server too busy. Queue is full.")
+            _queue_count += 1
+            return True
+        _active_requests += 1
+        return False
+
+
+async def _release_concurrency(queued: bool):
+    global _active_requests, _queue_count
+    async with _request_lock:
+        if queued:
+            _queue_count -= 1
+        else:
+            _active_requests = max(0, _active_requests - 1)
+
+
+def _process_audio_sync(file_path: str, model_mode: str,
+                        is_dual_channel: bool, output_format: str) -> dict:
+    audio_info = process_audio(file_path, is_dual_channel=is_dual_channel,
+                               model_mode=model_mode)
+    classifier = get_classifier(model_mode)
+    sentence_results = []
+    is_dual = is_dual_channel and audio_info.channels >= 2
+    timeout = time.time() + REQUEST_TIMEOUT
+    completed = True
+    incomplete_reason = None
+
+    for seg in audio_info.segments:
+        if time.time() > timeout:
+            completed = False
+            incomplete_reason = f"Timeout after {REQUEST_TIMEOUT}s. Partial results returned."
+            break
+        features = extract_features(seg.audio_data, audio_info.sample_rate,
+                                    seg.start_time, seg.end_time, seg.speaker_id)
+        emotion_result = classifier.predict(seg.audio_data, audio_info.sample_rate, features)
+        sentence_results.append(SentenceEmotionResult(
+            start_time=seg.start_time,
+            end_time=seg.end_time,
+            speaker_id=seg.speaker_id,
+            emotion=emotion_result.emotion,
+            confidence=emotion_result.confidence,
+            valence=emotion_result.valence,
+            arousal=emotion_result.arousal
+        ))
+
+    dialogue_summary = compute_dialogue_summary(sentence_results, is_dual_speaker=is_dual)
+    metrics_config = get_metrics_config()
+    model_metrics = metrics_config.get("metrics", {}).get(model_mode, {})
+
+    return {
+        "audio_info": audio_info,
+        "sentences": sentence_results,
+        "dialogue_summary": dialogue_summary,
+        "metrics": model_metrics,
+        "completed": completed,
+        "incomplete_reason": incomplete_reason
+    }
+
+
+@app.post("/api/analyze", response_model=AnalyzeResponse)
+async def analyze_audio(
+    file: UploadFile = File(...),
+    model_mode: str = Query("svm", pattern="^(svm|rf|wav2vec2)$"),
+    is_dual_channel: bool = Query(False),
+    output_format: str = Query("full", pattern="^(full|compact)$")
+):
+    queued = False
+    try:
+        queued = await _check_concurrency()
+        contents = await file.read()
+        if len(contents) > MAX_FILE_SIZE:
+            raise HTTPException(status_code=413,
+                                detail=f"File too large. Max {config['max_file_size_mb']}MB.")
+
+        suffix = os.path.splitext(file.filename or "audio.wav")[1]
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(contents)
+            tmp_path = tmp.name
+
+        try:
+            task_id = str(uuid.uuid4())
+            loop = asyncio.get_event_loop()
+            result = await asyncio.wait_for(
+                loop.run_in_executor(None, _process_audio_sync,
+                                     tmp_path, model_mode, is_dual_channel, output_format),
+                timeout=REQUEST_TIMEOUT + 10
+            )
+        except asyncio.TimeoutError:
+            raise HTTPException(status_code=504, detail="Processing timeout.")
+        finally:
+            os.unlink(tmp_path)
+
+        audio_info = result["audio_info"]
+        sentences = result["sentences"]
+        summary = result["dialogue_summary"]
+        metrics = result["metrics"]
+
+        sentence_resp = []
+        for s in sentences:
+            item = SentenceResultResponse(
+                start_time=s.start_time, end_time=s.end_time,
+                speaker_id=s.speaker_id, emotion=s.emotion,
+                confidence=s.confidence, valence=s.valence, arousal=s.arousal
+            )
+            if output_format == "compact":
+                pass
+            sentence_resp.append(item)
+
+        tp_resp = [TurningPointResponse(time=t.time, valence_before=t.valence_before,
+                    valence_after=t.valence_after, delta=t.delta)
+                   for t in summary.turning_points]
+        esc_resp = [EscalationIntervalResponse(start_time=e.start_time, end_time=e.end_time,
+                    avg_arousal=e.avg_arousal) for e in summary.escalation_intervals]
+        cont_resp = [ContagionEventResponse(source_speaker=c.source_speaker,
+                     target_speaker=c.target_speaker, source_time=c.source_time,
+                     target_time=c.target_time, delay_sentences=c.delay_sentences,
+                     contagion_strength=c.contagion_strength)
+                     for c in summary.contagion_events]
+
+        summary_resp = DialogueSummaryResponse(
+            dominant_emotion=summary.dominant_emotion,
+            valence_std=summary.valence_std,
+            conflict_density=summary.conflict_density,
+            turning_points=tp_resp,
+            escalation_intervals=esc_resp,
+            contagion_events=cont_resp
+        )
+
+        metrics_resp = MetricsResponse(
+            uar=metrics.get("uar", 0.0),
+            f1_scores=metrics.get("f1_scores", {}),
+            confusion_matrix=metrics.get("confusion_matrix", [])
+        )
+
+        response = AnalyzeResponse(
+            task_id=task_id,
+            audio_info=AudioInfoResponse(
+                duration=audio_info.duration,
+                sample_rate=audio_info.sample_rate,
+                channels=audio_info.channels
+            ),
+            sentences=sentence_resp,
+            dialogue_summary=summary_resp,
+            metrics=metrics_resp,
+            model_mode=model_mode,
+            completed=result["completed"],
+            incomplete_reason=result["incomplete_reason"]
+        )
+
+        _results_store[task_id] = response.dict()
+        return response
+
+    finally:
+        await _release_concurrency(queued)
+
+
+@app.get("/api/results/{task_id}", response_model=QueryResponse)
+async def get_result(task_id: str):
+    result = _results_store.get(task_id)
+    if result is None:
+        return QueryResponse(task_id=task_id, error="Result not found")
+    return QueryResponse(task_id=task_id, result=AnalyzeResponse(**result))
+
+
+@app.get("/api/health", response_model=HealthResponse)
+async def health_check():
+    models_loaded = {}
+    try:
+        from app.emotion_classifier import SVMClassifier, RFClassifier, Wav2Vec2Classifier
+        models_loaded["svm"] = SVMClassifier().is_loaded()
+        models_loaded["rf"] = RFClassifier().is_loaded()
+        try:
+            models_loaded["wav2vec2"] = Wav2Vec2Classifier().is_loaded()
+        except Exception:
+            models_loaded["wav2vec2"] = False
+    except Exception:
+        models_loaded = {"svm": False, "rf": False, "wav2vec2": False}
+
+    return HealthResponse(
+        status="healthy",
+        version=config["app_version"],
+        models_loaded=models_loaded
+    )
