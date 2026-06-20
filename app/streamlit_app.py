@@ -12,6 +12,7 @@ import json
 import struct
 import wave
 import base64
+import time
 from datetime import datetime
 
 API_BASE = os.environ.get("API_BASE_URL", "http://localhost:8000")
@@ -629,9 +630,518 @@ def render_summary(result):
                        f"延迟{ce['delay_sentences']}句, 强度{ce['contagion_strength']:.2f}")
 
 
+def call_batch_submit_api(files, batch_config):
+    url = f"{API_BASE}/api/batch/submit"
+    files_data = [("files", (f.name, f.getvalue())) for f in files]
+    params = {"batch_config": json.dumps(batch_config)}
+    try:
+        resp = requests.post(url, files=files_data, params=params, timeout=30)
+        resp.raise_for_status()
+        return resp.json()
+    except requests.exceptions.RequestException as e:
+        st.error(f"批量提交失败: {e}")
+        if hasattr(e, 'response') and e.response is not None:
+            try:
+                detail = e.response.json().get("detail", e.response.text)
+                st.error(f"错误详情: {detail}")
+            except Exception:
+                st.error(f"响应: {e.response.text}")
+        return None
+
+
+def call_batch_status_api(batch_id):
+    url = f"{API_BASE}/api/batch/{batch_id}/status"
+    try:
+        resp = requests.get(url, timeout=5)
+        resp.raise_for_status()
+        return resp.json()
+    except requests.exceptions.RequestException as e:
+        return None
+
+
+def call_batch_report_api(batch_id, format="json"):
+    url = f"{API_BASE}/api/batch/{batch_id}/report"
+    params = {"format": format}
+    try:
+        resp = requests.get(url, params=params, timeout=10)
+        if resp.status_code == 202:
+            return {"status": "processing", "data": resp.json()}
+        resp.raise_for_status()
+        if format == "json":
+            return {"status": "completed", "data": resp.json()}
+        else:
+            return {"status": "completed", "data": resp.text}
+    except requests.exceptions.RequestException as e:
+        if hasattr(e, 'response') and e.response is not None and e.response.status_code == 404:
+            return {"status": "not_found", "data": None}
+        return {"status": "error", "data": str(e)}
+
+
+def plot_batch_emotion_radar(report):
+    comparison = report.get("comparison", {})
+    if "emotion_distribution" not in comparison:
+        return
+
+    dist = comparison["emotion_distribution"]["distributions"]
+    file_summaries = report.get("file_summaries", {})
+
+    fig = go.Figure()
+
+    for fid, emotions in dist.items():
+        fname = file_summaries.get(fid, {}).get("filename", fid)
+        values = [emotions[e] for e in EMOTION_LABELS]
+        fig.add_trace(go.Scatterpolar(
+            r=values,
+            theta=[EMOTION_LABELS_CN.get(e, e) for e in EMOTION_LABELS],
+            fill='toself',
+            name=fname,
+            opacity=0.6
+        ))
+
+    fig.update_layout(
+        polar=dict(radialaxis=dict(visible=True, range=[0, 1])),
+        showlegend=True,
+        title="情感分布雷达图对比",
+        height=500
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def plot_batch_emotion_bar(report):
+    comparison = report.get("comparison", {})
+    if "emotion_distribution" not in comparison:
+        return
+
+    dist = comparison["emotion_distribution"]["distributions"]
+    file_summaries = report.get("file_summaries", {})
+
+    fig = go.Figure()
+    x_labels = [EMOTION_LABELS_CN.get(e, e) for e in EMOTION_LABELS]
+
+    for fid, emotions in dist.items():
+        fname = file_summaries.get(fid, {}).get("filename", fid)
+        fig.add_trace(go.Bar(
+            name=fname,
+            x=x_labels,
+            y=[emotions[e] for e in EMOTION_LABELS]
+        ))
+
+    fig.update_layout(
+        barmode='group',
+        title="情感分布柱状图对比",
+        xaxis_title="情感类型",
+        yaxis_title="占比",
+        height=450
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def plot_valence_trend_comparison(report):
+    comparison = report.get("comparison", {})
+    if "valence_trend" not in comparison:
+        return
+
+    trends = comparison["valence_trend"]["trends"]
+    file_summaries = report.get("file_summaries", {})
+
+    fig = go.Figure()
+
+    for fid, data in trends.items():
+        fname = file_summaries.get(fid, {}).get("filename", fid)
+        valences = data["valence_values"]
+        x = list(range(len(valences)))
+        fig.add_trace(go.Scatter(
+            x=x, y=valences, mode='lines',
+            name=f'{fname} ({data["trend"]}, slope={data["slope"]:.4f})',
+            line=dict(width=2)
+        ))
+
+    fig.update_layout(
+        title="效价趋势曲线对比",
+        xaxis_title="句子序号",
+        yaxis_title="效价 (Valence)",
+        yaxis_range=[-1.1, 1.1],
+        height=450,
+        showlegend=True
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def plot_arousal_pattern_comparison(report):
+    comparison = report.get("comparison", {})
+    if "arousal_pattern" not in comparison:
+        return
+
+    patterns = comparison["arousal_pattern"]["patterns"]
+    file_summaries = report.get("file_summaries", {})
+
+    fids = list(patterns.keys())
+    fnames = [file_summaries.get(f, {}).get("filename", f) for f in fids]
+    stds = [patterns[f]["arousal_std"] for f in fids]
+    means = [patterns[f]["mean_arousal"] for f in fids]
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=fnames, y=stds, name="唤醒度标准差",
+        marker_color='indianred', opacity=0.7
+    ))
+    fig.add_trace(go.Bar(
+        x=fnames, y=means, name="平均唤醒度",
+        marker_color='lightsalmon', opacity=0.7
+    ))
+
+    fig.update_layout(
+        barmode='group',
+        title="唤醒度模式对比",
+        xaxis_title="文件",
+        yaxis_title="数值",
+        height=400
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def plot_baseline_deviation_heatmap(report):
+    comparison = report.get("comparison", {})
+    meta = report.get("meta", {})
+    baseline_file = meta.get("baseline_file")
+    if not baseline_file:
+        return
+
+    file_summaries = report.get("file_summaries", {})
+    baseline_name = file_summaries.get(baseline_file, {}).get("filename", "基线")
+
+    deviation_data = []
+    dimensions = []
+    file_names = []
+
+    if "emotion_distribution" in comparison and "baseline_deviations" in comparison["emotion_distribution"]:
+        devs = comparison["emotion_distribution"]["baseline_deviations"]
+        for fid, dev in devs.items():
+            if fid not in file_names:
+                file_names.append(fid)
+            deviation_data.append(abs(dev["js_divergence"]))
+        dimensions.append("情感分布(JS散度)")
+
+    if "valence_trend" in comparison and "baseline_deviations" in comparison["valence_trend"]:
+        devs = comparison["valence_trend"]["baseline_deviations"]
+        for fid, dev in devs.items():
+            if fid not in file_names:
+                file_names.append(fid)
+            deviation_data.append(abs(dev["slope_deviation"]))
+        dimensions.append("效价趋势(斜率差)")
+
+    if "arousal_pattern" in comparison and "baseline_deviations" in comparison["arousal_pattern"]:
+        devs = comparison["arousal_pattern"]["baseline_deviations"]
+        for fid, dev in devs.items():
+            if fid not in file_names:
+                file_names.append(fid)
+            deviation_data.append(abs(dev["std_deviation"]))
+        dimensions.append("唤醒度模式(标准差差)")
+
+    if not deviation_data or not dimensions:
+        return
+
+    n_files = len(file_names)
+    n_dims = len(dimensions)
+    heatmap_data = np.array(deviation_data).reshape(n_dims, n_files)
+
+    display_names = [file_summaries.get(f, {}).get("filename", f) for f in file_names]
+
+    fig = go.Figure(data=go.Heatmap(
+        z=heatmap_data,
+        x=display_names,
+        y=dimensions,
+        colorscale='Reds',
+        showscale=True,
+        text=[[f"{v:.4f}" for v in row] for row in heatmap_data],
+        texttemplate="%{text}",
+        textfont={"size": 12}
+    ))
+
+    fig.update_layout(
+        title=f"基线偏差热力图 (基线: {baseline_name})",
+        xaxis_title="对比文件",
+        yaxis_title="对比维度",
+        height=400
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def plot_similarity_matrix(report):
+    comparison = report.get("comparison", {})
+    if "speaker_similarity" not in comparison:
+        return
+
+    sim_matrix = comparison["speaker_similarity"].get("cross_file_similarity_matrix", {})
+    file_summaries = report.get("file_summaries", {})
+    dual_files = comparison["speaker_similarity"].get("dual_channel_files", [])
+
+    if len(dual_files) < 2:
+        st.info("双通道文件不足2个，无法生成相似度矩阵")
+        return
+
+    display_names = [file_summaries.get(f, {}).get("filename", f) for f in dual_files]
+    n = len(dual_files)
+    matrix = np.ones((n, n))
+
+    for key, value in sim_matrix.items():
+        f1, f2 = key.split("__")
+        if f1 in dual_files and f2 in dual_files:
+            i = dual_files.index(f1)
+            j = dual_files.index(f2)
+            matrix[i][j] = value
+            matrix[j][i] = value
+
+    fig = go.Figure(data=go.Heatmap(
+        z=matrix,
+        x=display_names,
+        y=display_names,
+        colorscale='Blues',
+        showscale=True,
+        zmin=0, zmax=1,
+        text=[[f"{v:.3f}" for v in row] for row in matrix],
+        texttemplate="%{text}",
+        textfont={"size": 12}
+    ))
+
+    fig.update_layout(
+        title="双通道文件说话人同步性相似度矩阵",
+        xaxis_title="文件",
+        yaxis_title="文件",
+        height=450
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def render_batch_page():
+    st.header("📊 批量对比分析")
+
+    health = call_health_api()
+    if health:
+        st.sidebar.success(f"API服务运行中 v{health.get('version', '?')}")
+    else:
+        st.sidebar.error("API服务未连接")
+
+    st.subheader("1. 上传音频文件")
+    uploaded_files = st.file_uploader(
+        "选择多个音频文件 (2-20个, 支持WAV/MP3/FLAC/OGG/M4A)",
+        type=["wav", "mp3", "flac", "ogg", "m4a"],
+        accept_multiple_files=True
+    )
+
+    if uploaded_files:
+        st.info(f"已选择 {len(uploaded_files)} 个文件")
+        for f in uploaded_files:
+            st.caption(f"📄 {f.name} ({f.size/1024/1024:.2f} MB)")
+
+    st.subheader("2. 对比配置")
+
+    batch_name = st.text_input("批次名称", value=f"批次_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+
+    dimension_options = [
+        ("emotion_distribution", "情感分布对比"),
+        ("valence_trend", "效价趋势对比"),
+        ("arousal_pattern", "唤醒度模式对比"),
+        ("speaker_similarity", "说话人同步性对比")
+    ]
+
+    selected_dims = st.multiselect(
+        "选择对比维度 (至少选择1个)",
+        [d[0] for d in dimension_options],
+        format_func=lambda x: dict(dimension_options)[x],
+        default=[d[0] for d in dimension_options]
+    )
+
+    baseline_file = None
+    if uploaded_files:
+        baseline_file = st.selectbox(
+            "选择基线文件 (可选，其他文件将与此文件对比)",
+            ["无"] + [f.name for f in uploaded_files]
+        )
+        if baseline_file == "无":
+            baseline_file = None
+
+    st.subheader("3. 提交任务")
+
+    if st.button("🚀 提交批量分析任务", type="primary", disabled=not (uploaded_files and selected_dims)):
+        if not uploaded_files or len(uploaded_files) < 2:
+            st.error("请至少上传2个音频文件")
+        elif not selected_dims:
+            st.error("请至少选择1个对比维度")
+        elif len(uploaded_files) > 20:
+            st.error("最多只能上传20个音频文件")
+        else:
+            batch_config = {
+                "batch_name": batch_name,
+                "dimensions": selected_dims,
+                "baseline_file": baseline_file
+            }
+            with st.spinner("正在提交批量任务..."):
+                result = call_batch_submit_api(uploaded_files, batch_config)
+                if result:
+                    st.session_state["batch_id"] = result["batch_id"]
+                    st.session_state["batch_status"] = None
+                    st.session_state["batch_report"] = None
+                    st.success(f"✅ 批量任务提交成功! Batch ID: {result['batch_id']}")
+
+    if "batch_id" in st.session_state:
+        st.markdown("---")
+        batch_id = st.session_state["batch_id"]
+        st.info(f"当前批次ID: `{batch_id}`")
+
+        col1, col2 = st.columns([1, 1])
+        with col1:
+            if st.button("🔄 刷新状态", use_container_width=True):
+                pass
+        with col2:
+            if st.button("❌ 清除当前批次", use_container_width=True):
+                for key in ["batch_id", "batch_status", "batch_report"]:
+                    if key in st.session_state:
+                        del st.session_state[key]
+                st.rerun()
+
+        status = call_batch_status_api(batch_id)
+        if status:
+            progress = status["progress"]
+            st.subheader("📊 处理进度")
+            progress_bar = st.progress(progress["percentage"] / 100)
+            st.metric(
+                label="整体进度",
+                value=f"{progress['completed']}/{progress['total']}",
+                delta=f"{progress['percentage']:.1f}%"
+            )
+
+            st.subheader("📁 文件状态")
+            status_df = pd.DataFrame([
+                {
+                    "文件名": f["filename"],
+                    "状态": {
+                        "pending": "⏳ 等待中",
+                        "processing": "⚙️ 处理中",
+                        "completed": "✅ 完成",
+                        "failed": "❌ 失败"
+                    }.get(f["status"], f["status"]),
+                    "错误": f.get("error", "")
+                }
+                for f in status["files"]
+            ])
+            st.dataframe(status_df, use_container_width=True)
+
+            if progress["percentage"] < 100:
+                st.info("⏳ 正在处理中，页面将自动刷新...")
+                time.sleep(3)
+                st.rerun()
+            else:
+                st.success("✅ 所有文件处理完成!")
+
+        st.subheader("📋 对比报告")
+        report_result = call_batch_report_api(batch_id)
+        if report_result["status"] == "processing":
+            st.info("⏳ 报告生成中，请稍候...")
+        elif report_result["status"] == "completed":
+            report = report_result["data"]
+            if "error" in report:
+                st.error(f"报告生成失败: {report['error']}")
+            else:
+                meta = report.get("meta", {})
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric("批次名称", meta.get("batch_name", ""))
+                with col2:
+                    st.metric("总文件数", meta.get("total_files", 0))
+                with col3:
+                    st.metric("成功数", meta.get("success_count", 0))
+                with col4:
+                    st.metric("总耗时", f"{meta.get('total_duration_seconds', 0):.1f}s")
+
+                col_csv, col_json = st.columns(2)
+                with col_csv:
+                    csv_result = call_batch_report_api(batch_id, format="csv")
+                    if csv_result["status"] == "completed":
+                        st.download_button(
+                            label="📊 下载CSV报告",
+                            data=csv_result["data"],
+                            file_name=f"batch_report_{batch_id}.csv",
+                            mime="text/csv",
+                            use_container_width=True
+                        )
+                with col_json:
+                    st.download_button(
+                        label="📄 下载JSON报告",
+                        data=json.dumps(report, ensure_ascii=False, indent=2),
+                        file_name=f"batch_report_{batch_id}.json",
+                        mime="application/json",
+                        use_container_width=True
+                    )
+
+                comparison = report.get("comparison", {})
+                if "emotion_distribution" in comparison:
+                    st.markdown("---")
+                    st.subheader("🎭 情感分布对比")
+                    plot_batch_emotion_radar(report)
+                    plot_batch_emotion_bar(report)
+
+                    most_div = comparison["emotion_distribution"].get("most_divergent_pair", {})
+                    if most_div.get("file1"):
+                        f1 = report["file_summaries"].get(most_div["file1"], {}).get("filename", most_div["file1"])
+                        f2 = report["file_summaries"].get(most_div["file2"], {}).get("filename", most_div["file2"])
+                        st.info(f"🔍 情感分布差异最大的文件对: **{f1}** vs **{f2}** (JS散度: {most_div['js_divergence']:.4f})")
+
+                if "valence_trend" in comparison:
+                    st.markdown("---")
+                    st.subheader("📈 效价趋势对比")
+                    plot_valence_trend_comparison(report)
+
+                    anomalous = comparison["valence_trend"].get("anomalous_files", [])
+                    if anomalous:
+                        names = [report["file_summaries"].get(f, {}).get("filename", f) for f in anomalous]
+                        st.warning(f"⚠️ 趋势异常文件: {', '.join(names)}")
+
+                    for fid, data in comparison["valence_trend"]["trends"].items():
+                        fname = report["file_summaries"].get(fid, {}).get("filename", fid)
+                        trend_cn = {"rising": "上升", "falling": "下降", "stationary": "平稳"}.get(data["trend"], data["trend"])
+                        st.caption(f"📊 {fname}: 趋势={trend_cn}, 斜率={data['slope']:.4f}, 平均效价={data['mean_valence']:.3f}")
+
+                if "arousal_pattern" in comparison:
+                    st.markdown("---")
+                    st.subheader("⚡ 唤醒度模式对比")
+                    plot_arousal_pattern_comparison(report)
+
+                    files_with_esc = comparison["arousal_pattern"].get("files_with_escalation", [])
+                    if files_with_esc:
+                        names = [report["file_summaries"].get(f, {}).get("filename", f) for f in files_with_esc]
+                        st.warning(f"⚠️ 存在情绪激化区间的文件: {', '.join(names)}")
+
+                if "speaker_similarity" in comparison:
+                    st.markdown("---")
+                    st.subheader("👥 说话人同步性对比")
+                    plot_similarity_matrix(report)
+
+                    sync_data = comparison["speaker_similarity"].get("speaker_sync", {})
+                    for fid, data in sync_data.items():
+                        fname = report["file_summaries"].get(fid, {}).get("filename", fid)
+                        if data["is_dual_channel"]:
+                            if data["synchronization"]:
+                                sync = data["synchronization"]
+                                level_cn = {"high": "高", "medium": "中", "low": "低"}.get(sync["alignment_level"], sync["alignment_level"])
+                                st.caption(f"🎙️ {fname}: 同步分数={sync['synchronization_score']:.3f}, 等级={level_cn}")
+                            else:
+                                st.caption(f"🎙️ {fname}: 双通道但说话人数据不足")
+                        else:
+                            st.caption(f"🎙️ {fname}: 单通道，跳过同步性分析")
+
+                if meta.get("baseline_file"):
+                    st.markdown("---")
+                    st.subheader("📊 基线偏差分析")
+                    plot_baseline_deviation_heatmap(report)
+
+                st.markdown("---")
+                with st.expander("📄 查看完整报告JSON", expanded=False):
+                    st.json(report)
+
+
 def main():
     st.set_page_config(page_title="语音情感识别与情绪追踪", layout="wide")
-    st.title("🎙️ 语音情感识别与多轮对话情绪追踪")
 
     health = call_health_api()
     if health:
@@ -642,116 +1152,125 @@ def main():
     else:
         st.sidebar.error("API服务未连接")
 
-    st.sidebar.header("参数设置")
-    model_mode = st.sidebar.selectbox("模型模式", ["svm", "rf", "wav2vec2"], index=0)
-    is_dual = st.sidebar.checkbox("双通道录音", value=False)
-    output_fmt = st.sidebar.selectbox("输出格式", ["full", "compact"], index=0)
+    tab_single, tab_batch = st.tabs(["🎙️ 单文件分析", "📊 批量对比"])
 
-    uploaded_file = st.file_uploader("上传音频文件 (WAV/MP3, 最大50MB)",
-                                     type=["wav", "mp3"])
+    with tab_single:
+        st.title("🎙️ 语音情感识别与多轮对话情绪追踪")
 
-    if uploaded_file is not None:
-        file_bytes = uploaded_file.read()
-        st.audio(uploaded_file, format=uploaded_file.type if uploaded_file.type else "audio/wav")
+        st.sidebar.header("参数设置")
+        model_mode = st.sidebar.selectbox("模型模式", ["svm", "rf", "wav2vec2"], index=0, key="single_model_mode")
+        is_dual = st.sidebar.checkbox("双通道录音", value=False, key="single_is_dual")
+        output_fmt = st.sidebar.selectbox("输出格式", ["full", "compact"], index=0, key="single_output_fmt")
 
-        if "audio_raw" not in st.session_state or st.session_state.get("audio_filename") != uploaded_file.name:
-            parsed_audio, parsed_sr = _parse_audio_bytes(file_bytes, uploaded_file.name)
-            st.session_state["audio_raw"] = parsed_audio
-            st.session_state["audio_sr"] = parsed_sr
-            st.session_state["audio_filename"] = uploaded_file.name
+        uploaded_file = st.file_uploader("上传音频文件 (WAV/MP3, 最大50MB)",
+                                         type=["wav", "mp3"], key="single_upload")
 
-        if st.button("🔍 开始分析", type="primary"):
-            with st.spinner("正在分析音频..."):
-                result = call_analyze_api(
-                    file_bytes, uploaded_file.name,
-                    model_mode, is_dual, output_fmt
-                )
+        if uploaded_file is not None:
+            file_bytes = uploaded_file.read()
+            st.audio(uploaded_file, format=uploaded_file.type if uploaded_file.type else "audio/wav")
 
-            if result:
-                st.session_state["analysis_result"] = result
-                st.session_state["analyzed_at"] = datetime.now().isoformat()
+            if "audio_raw" not in st.session_state or st.session_state.get("audio_filename") != uploaded_file.name:
+                parsed_audio, parsed_sr = _parse_audio_bytes(file_bytes, uploaded_file.name)
+                st.session_state["audio_raw"] = parsed_audio
+                st.session_state["audio_sr"] = parsed_sr
+                st.session_state["audio_filename"] = uploaded_file.name
 
-    if "analysis_result" in st.session_state:
-        result = st.session_state["analysis_result"]
+            if st.button("🔍 开始分析", type="primary", key="single_analyze_btn"):
+                with st.spinner("正在分析音频..."):
+                    result = call_analyze_api(
+                        file_bytes, uploaded_file.name,
+                        model_mode, is_dual, output_fmt
+                    )
 
-        if not result.get("completed", True):
-            st.warning(f"⚠️ 分析未完全完成: {result.get('incomplete_reason', '超时')}")
+                if result:
+                    st.session_state["analysis_result"] = result
+                    st.session_state["analyzed_at"] = datetime.now().isoformat()
 
-        st.header("📊 音频信息")
-        info = result.get("audio_info", {})
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("时长", f'{info.get("duration", 0):.1f}秒')
-        with col2:
-            st.metric("采样率", f'{info.get("sample_rate", 0)}Hz')
-        with col3:
-            st.metric("通道数", info.get("channels", 0))
+        if "analysis_result" in st.session_state:
+            result = st.session_state["analysis_result"]
 
-        st.header("🎵 波形与情感分段")
-        plot_waveform_with_emotions(
-            result,
-            audio_data=st.session_state.get("audio_raw"),
-            sr=st.session_state.get("audio_sr")
-        )
+            if not result.get("completed", True):
+                st.warning(f"⚠️ 分析未完全完成: {result.get('incomplete_reason', '超时')}")
 
-        st.header("📈 情绪轨迹曲线")
-        plot_emotion_trajectory(result)
+            st.header("📊 音频信息")
+            info = result.get("audio_info", {})
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("时长", f'{info.get("duration", 0):.1f}秒')
+            with col2:
+                st.metric("采样率", f'{info.get("sample_rate", 0)}Hz')
+            with col3:
+                st.metric("通道数", info.get("channels", 0))
 
-        st.header("🥧 情感分布")
-        plot_emotion_pie(result)
-
-        if is_dual:
-            st.header("👥 双人对话情绪分析")
-            plot_dual_speaker_trajectory(result)
-
-        st.header("📋 逐句情感结果")
-        render_sentence_table(result)
-
-        st.header("📝 对话情绪摘要")
-        col_summary, col_export = st.columns([3, 1])
-        with col_summary:
-            render_summary(result)
-        with col_export:
-            st.subheader("导出标注")
-            render_export_buttons(
+            st.header("🎵 波形与情感分段")
+            plot_waveform_with_emotions(
                 result,
-                st.session_state.get("audio_filename", "audio.wav"),
-                st.session_state.get("analyzed_at")
+                audio_data=st.session_state.get("audio_raw"),
+                sr=st.session_state.get("audio_sr")
             )
 
-        with st.expander("🔧 模型性能参考"):
-            metrics = result.get("metrics", {})
-            st.json(metrics)
+            st.header("📈 情绪轨迹曲线")
+            plot_emotion_trajectory(result)
 
-        sentences = result.get("sentences", [])
-        if sentences:
-            st.header("🎧 片段试听")
-            sent_idx = st.selectbox("选择片段", range(len(sentences)),
-                                    format_func=lambda i: f"句{i+1} ({sentences[i]['start_time']:.1f}s-{sentences[i]['end_time']:.1f}s) "
-                                                           f"- {EMOTION_LABELS_CN.get(sentences[i]['emotion'], sentences[i]['emotion'])}")
-            sel = sentences[sent_idx]
-            audio_raw = st.session_state.get("audio_raw")
-            audio_sr = st.session_state.get("audio_sr")
-            if audio_raw is not None and audio_sr is not None:
-                start_sample = int(sel["start_time"] * audio_sr)
-                end_sample = int(sel["end_time"] * audio_sr)
-                end_sample = min(end_sample, len(audio_raw))
-                if start_sample < end_sample:
-                    segment = audio_raw[start_sample:end_sample]
-                    wav_bytes = _audio_segment_to_wav_bytes(segment, audio_sr)
-                    st.audio(wav_bytes, format="audio/wav")
-                else:
-                    st.warning("片段时间范围无效")
-            else:
-                st.info(f"播放: {sel['start_time']:.1f}s - {sel['end_time']:.1f}s (原始音频未缓存，无法截取)")
+            st.header("🥧 情感分布")
+            plot_emotion_pie(result)
 
-            with st.expander("🎬 对话回放", expanded=False):
-                render_dialogue_playback(
+            if is_dual:
+                st.header("👥 双人对话情绪分析")
+                plot_dual_speaker_trajectory(result)
+
+            st.header("📋 逐句情感结果")
+            render_sentence_table(result)
+
+            st.header("📝 对话情绪摘要")
+            col_summary, col_export = st.columns([3, 1])
+            with col_summary:
+                render_summary(result)
+            with col_export:
+                st.subheader("导出标注")
+                render_export_buttons(
                     result,
-                    audio_raw=st.session_state.get("audio_raw"),
-                    audio_sr=st.session_state.get("audio_sr"),
-                    is_dual=is_dual
+                    st.session_state.get("audio_filename", "audio.wav"),
+                    st.session_state.get("analyzed_at")
                 )
+
+            with st.expander("🔧 模型性能参考"):
+                metrics = result.get("metrics", {})
+                st.json(metrics)
+
+            sentences = result.get("sentences", [])
+            if sentences:
+                st.header("🎧 片段试听")
+                sent_idx = st.selectbox("选择片段", range(len(sentences)),
+                                        format_func=lambda i: f"句{i+1} ({sentences[i]['start_time']:.1f}s-{sentences[i]['end_time']:.1f}s) "
+                                                               f"- {EMOTION_LABELS_CN.get(sentences[i]['emotion'], sentences[i]['emotion'])}",
+                                        key="single_sent_select")
+                sel = sentences[sent_idx]
+                audio_raw = st.session_state.get("audio_raw")
+                audio_sr = st.session_state.get("audio_sr")
+                if audio_raw is not None and audio_sr is not None:
+                    start_sample = int(sel["start_time"] * audio_sr)
+                    end_sample = int(sel["end_time"] * audio_sr)
+                    end_sample = min(end_sample, len(audio_raw))
+                    if start_sample < end_sample:
+                        segment = audio_raw[start_sample:end_sample]
+                        wav_bytes = _audio_segment_to_wav_bytes(segment, audio_sr)
+                        st.audio(wav_bytes, format="audio/wav")
+                    else:
+                        st.warning("片段时间范围无效")
+                else:
+                    st.info(f"播放: {sel['start_time']:.1f}s - {sel['end_time']:.1f}s (原始音频未缓存，无法截取)")
+
+                with st.expander("🎬 对话回放", expanded=False):
+                    render_dialogue_playback(
+                        result,
+                        audio_raw=st.session_state.get("audio_raw"),
+                        audio_sr=st.session_state.get("audio_sr"),
+                        is_dual=is_dual
+                    )
+
+    with tab_batch:
+        render_batch_page()
 
 
 if __name__ == "__main__":

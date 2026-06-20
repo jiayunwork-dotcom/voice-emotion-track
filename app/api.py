@@ -10,6 +10,7 @@ import io
 from datetime import datetime
 from typing import Dict, List, Optional
 
+import numpy as np
 from fastapi import FastAPI, File, UploadFile, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
@@ -18,10 +19,15 @@ from pydantic import BaseModel
 from app.config import get_config, get_metrics_config
 from app.audio_processor import process_audio
 from app.feature_extractor import extract_features
-from app.emotion_classifier import get_classifier, EmotionResult
+from app.emotion_classifier import get_classifier, EmotionResult, EMOTION_LABELS
 from app.dialogue_tracker import (
     SentenceEmotionResult, compute_dialogue_summary,
     TurningPoint, EscalationInterval, ContagionEvent, DialogueSummary
+)
+from app.batch_processor import (
+    create_batch_task, get_batch, get_batch_status,
+    BatchConfig, validate_file_extension, generate_csv_report,
+    FileStatus, BatchStatus
 )
 
 logger = logging.getLogger(__name__)
@@ -432,3 +438,198 @@ async def health_check():
         version=config["app_version"],
         models_loaded=models_loaded
     )
+
+
+class BatchSubmitResponse(BaseModel):
+    batch_id: str
+    message: str
+
+
+class BatchFileStatusResponse(BaseModel):
+    file_id: str
+    filename: str
+    status: str
+    error: Optional[str] = None
+    started_at: Optional[str] = None
+    completed_at: Optional[str] = None
+
+
+class BatchProgressResponse(BaseModel):
+    completed: int
+    total: int
+    percentage: float
+
+
+class BatchStatusResponse(BaseModel):
+    batch_id: str
+    status: str
+    progress: BatchProgressResponse
+    files: List[BatchFileStatusResponse]
+
+
+class BatchSubmitConfig(BaseModel):
+    batch_name: str
+    dimensions: List[str]
+    baseline_file: Optional[str] = None
+
+
+VALID_DIMENSIONS = {"emotion_distribution", "valence_trend", "arousal_pattern", "speaker_similarity"}
+MIN_FILES = 2
+MAX_FILES = 20
+
+
+@app.post("/api/batch/submit", response_model=BatchSubmitResponse)
+async def submit_batch(
+    files: List[UploadFile] = File(...),
+    batch_config: str = Query(...)
+):
+    try:
+        config_data = json.loads(batch_config)
+        batch_config_obj = BatchSubmitConfig(**config_data)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON in batch_config")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid batch_config: {str(e)}")
+
+    if len(files) < MIN_FILES or len(files) > MAX_FILES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Number of files must be between {MIN_FILES} and {MAX_FILES}"
+        )
+
+    invalid_files = []
+    for f in files:
+        if not validate_file_extension(f.filename or ""):
+            invalid_files.append(f.filename)
+
+    if invalid_files:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file formats: {', '.join(invalid_files)}. "
+                   f"Supported formats: {', '.join(['.wav', '.mp3', '.flac', '.ogg', '.m4a'])}"
+        )
+
+    if not batch_config_obj.dimensions:
+        raise HTTPException(status_code=400, detail="At least one dimension must be selected")
+
+    invalid_dims = [d for d in batch_config_obj.dimensions if d not in VALID_DIMENSIONS]
+    if invalid_dims:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid dimensions: {', '.join(invalid_dims)}. "
+                   f"Valid dimensions: {', '.join(VALID_DIMENSIONS)}"
+        )
+
+    file_ids = {}
+    for f in files:
+        fid = str(uuid.uuid4())
+        file_ids[f.filename or fid] = fid
+
+    baseline_file_id = None
+    if batch_config_obj.baseline_file:
+        if batch_config_obj.baseline_file not in file_ids:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Baseline file '{batch_config_obj.baseline_file}' not found in uploaded files"
+            )
+        baseline_file_id = file_ids[batch_config_obj.baseline_file]
+
+    files_data = []
+    filename_to_temp_id = {}
+    for f in files:
+        content = await f.read()
+        if len(content) > MAX_FILE_SIZE:
+            raise HTTPException(
+                status_code=413,
+                detail=f"File {f.filename} too large. Max {config['max_file_size_mb']}MB."
+            )
+        temp_id = str(uuid.uuid4())
+        filename = f.filename or "audio.wav"
+        files_data.append((filename, content, temp_id))
+        filename_to_temp_id[filename] = temp_id
+
+    resolved_baseline_id = None
+    if batch_config_obj.baseline_file:
+        resolved_baseline_id = filename_to_temp_id.get(batch_config_obj.baseline_file)
+
+    batch_config_internal = BatchConfig(
+        batch_name=batch_config_obj.batch_name,
+        dimensions=batch_config_obj.dimensions,
+        baseline_file=resolved_baseline_id
+    )
+
+    batch = create_batch_task(batch_config_internal, files_data)
+
+    return BatchSubmitResponse(
+        batch_id=batch.batch_id,
+        message="Batch submitted successfully"
+    )
+
+
+@app.get("/api/batch/{batch_id}/status", response_model=BatchStatusResponse)
+async def get_batch_status_api(batch_id: str):
+    status = get_batch_status(batch_id)
+    if status is None:
+        raise HTTPException(status_code=404, detail="Batch not found")
+
+    files_resp = [
+        BatchFileStatusResponse(**f) for f in status["files"]
+    ]
+
+    return BatchStatusResponse(
+        batch_id=status["batch_id"],
+        status=status["status"],
+        progress=BatchProgressResponse(**status["progress"]),
+        files=files_resp
+    )
+
+
+@app.get("/api/batch/{batch_id}/report")
+async def get_batch_report(
+    batch_id: str,
+    format: str = Query("json", pattern="^(json|csv)$")
+):
+    batch = get_batch(batch_id)
+    if batch is None:
+        raise HTTPException(status_code=404, detail="Batch not found")
+
+    if batch.status not in (BatchStatus.COMPLETED, BatchStatus.FAILED):
+        return Response(
+            content=json.dumps({
+                "status": "processing",
+                "message": "Batch is still processing. Check status endpoint for progress."
+            }, ensure_ascii=False),
+            status_code=202,
+            media_type="application/json"
+        )
+
+    if batch.report is None:
+        raise HTTPException(status_code=500, detail="Report generation failed")
+
+    if format == "csv":
+        csv_content = generate_csv_report(batch.report)
+        response = Response(
+            content=csv_content,
+            media_type="text/csv"
+        )
+        response.headers["Content-Disposition"] = f'attachment; filename="batch_report_{batch_id}.csv"'
+        return response
+    else:
+        def clean_for_json(obj):
+            if isinstance(obj, dict):
+                return {k: clean_for_json(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [clean_for_json(v) for v in obj]
+            elif isinstance(obj, (np.ndarray, np.generic)):
+                return obj.tolist()
+            elif isinstance(obj, (SentenceEmotionResult, DialogueSummary,
+                                  TurningPoint, EscalationInterval, ContagionEvent)):
+                return clean_for_json(obj.__dict__)
+            else:
+                return obj
+
+        clean_report = clean_for_json(batch.report)
+        return Response(
+            content=json.dumps(clean_report, ensure_ascii=False, indent=2),
+            media_type="application/json"
+        )
